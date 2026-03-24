@@ -1,1 +1,3 @@
 ﻿*.Identifier*
+__pycache__/
+*.py[cod]
