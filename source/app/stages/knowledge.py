@@ -610,7 +610,12 @@ class KnowledgeStage:
 
         language = task.language or infer_language(osv_payload)
         repo_url = task.repo_url or infer_repo_url(osv_payload)
-        vulnerable_ref, fixed_ref = infer_git_refs(osv_payload, fallback_fixed=task.fixed_ref, fallback_vulnerable=task.vulnerable_ref)
+        vulnerable_ref, fixed_ref = infer_git_refs(
+            osv_payload,
+            fallback_fixed=task.fixed_ref,
+            fallback_vulnerable=task.vulnerable_ref,
+            repo_url=repo_url,
+        )
 
         if repo_url:
             task_data["repo_url"] = repo_url
@@ -967,9 +972,61 @@ def infer_repo_url(osv_payload: dict) -> Optional[str]:
     return None
 
 
-def infer_git_refs(osv_payload: dict, fallback_fixed: Optional[str], fallback_vulnerable: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+def extract_github_repo_slug(repo_url: Optional[str]) -> Optional[str]:
+    if not repo_url:
+        return None
+
+    parts = urlsplit(repo_url)
+    if "github.com" not in parts.netloc.lower():
+        return None
+
+    path_parts = [segment for segment in parts.path.split("/") if segment]
+    if len(path_parts) < 2:
+        return None
+
+    owner = path_parts[0]
+    repo = path_parts[1].removesuffix(".git")
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}"
+
+
+def fetch_github_parent_ref(repo_url: Optional[str], commit_ref: Optional[str]) -> Optional[str]:
+    repo_slug = extract_github_repo_slug(repo_url)
+    if not repo_slug or not commit_ref:
+        return None
+
+    request = Request(
+        f"https://api.github.com/repos/{repo_slug}/commits/{commit_ref}",
+        headers={
+            "User-Agent": KnowledgeStage._USER_AGENT,
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+    parents = payload.get("parents") or []
+    if not parents:
+        return None
+
+    first_parent = parents[0]
+    if not isinstance(first_parent, dict):
+        return None
+    parent_sha = first_parent.get("sha")
+    return parent_sha if isinstance(parent_sha, str) and parent_sha else None
+
+
+def infer_git_refs(
+    osv_payload: dict,
+    fallback_fixed: Optional[str],
+    fallback_vulnerable: Optional[str],
+    repo_url: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
     fixed_ref = fallback_fixed
-    vulnerable_ref = fallback_vulnerable
 
     for item in osv_payload.get("references", []):
         url = item.get("url", "")
@@ -982,13 +1039,11 @@ def infer_git_refs(osv_payload: dict, fallback_fixed: Optional[str], fallback_vu
             if item.get("type") != "GIT":
                 continue
             for event in item.get("events", []):
-                introduced = event.get("introduced")
                 fixed = event.get("fixed")
-                if introduced and introduced != "0":
-                    vulnerable_ref = vulnerable_ref or introduced
                 if fixed:
                     fixed_ref = fixed_ref or fixed
 
+    vulnerable_ref = fetch_github_parent_ref(repo_url, fixed_ref) or fallback_vulnerable
     return vulnerable_ref, fixed_ref
 
 
