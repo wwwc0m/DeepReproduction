@@ -11,7 +11,7 @@
 其中：
 
 - `knowledge` 作为静态前处理阶段，负责收集外部漏洞知识并生成 `knowledge.yaml`
-- `build`、`poc`、`verify` 作为动态执行阶段，负责在本地工作区中完成真实构建、触发与验证
+- `build`、`poc`、`verify` 作为动态执行阶段，负责在 Docker 容器中完成真实构建、触发与验证
 
 因此，后续三阶段的设计原则应为：
 
@@ -19,6 +19,7 @@
 2. `knowledge` 中的 build 信息只视为候选线索，不视为最终事实
 3. 后续三阶段共享同一个 workspace，不重复做外部知识搜索
 4. 真正的源码下载、版本切换、构建确认应由 `build` 阶段主导完成
+5. `build`、`poc`、`verify` 的真实执行均通过 Docker 完成，宿主机只负责准备 workspace 和调度容器
 
 ## 总体开发顺序
 
@@ -43,7 +44,7 @@
 - 扫描仓库中的真实构建文件
 - 读取 README、INSTALL、CI 配置等构建线索
 - 生成 `Dockerfile`、`build.sh`
-- 执行构建并产出日志
+- 通过 Docker 执行构建并产出日志
 - 输出“确认后的构建事实”
 
 不要做的事：
@@ -74,6 +75,7 @@
 - 从 patch、源码、函数路径、错误模式中提炼触发条件
 - 生成 PoC 主文件、辅助输入文件和运行脚本
 - 在已准备好的 workspace 中执行 PoC
+- 通过 Docker 容器执行 PoC
 - 收集崩溃日志或错误输出
 
 不要做的事：
@@ -102,6 +104,7 @@
 - 基于 `KnowledgeModel`、`BuildArtifact`、`PoCArtifact` 做前后版本对比验证
 - 在 vulnerable 版本上验证漏洞可触发
 - 在 fixed 版本上验证漏洞不再触发或行为改变
+- 通过 Docker 容器完成前后版本运行和日志比对
 - 归纳验证结论和证据
 
 不要做的事：
@@ -157,6 +160,8 @@ workspaces/<CVE>/
 - `build` 阶段拥有 `repo/` 和 `artifacts/build/` 的写权限
 - `poc` 阶段不重建 repo，只读 `repo/`，写 `artifacts/poc/`
 - `verify` 阶段只消费前两者产物，写 `artifacts/verify/`
+- `build`、`poc`、`verify` 的脚本都默认以 `workspaces/<CVE>/` 作为 Docker build context 或挂载根目录
+- 宿主机不直接运行 `build.sh`、`run.sh` 或 verify 对比命令
 
 ## Schema 开发清单
 
