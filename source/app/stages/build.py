@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,6 +49,7 @@ class BuildStagePaths:
         self.build_plan_yaml = self.build_dir / "build_plan.yaml"
         self.build_context_yaml = self.build_dir / "build_context.yaml"
         self.build_artifact_yaml = self.build_dir / "build_artifact.yaml"
+        self.build_verify_yaml = self.build_dir / "build_verify.yaml"
 
 
 class RefSnapshot(BaseModel):
@@ -230,14 +232,32 @@ class BuildStage:
             str(paths.build_artifact_yaml),
             yaml.safe_dump(artifact.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
         )
+
+        try:
+            verify_payload = self._verify_build_artifact(
+                artifact=artifact,
+                paths=paths,
+                plan_meta=plan_meta,
+                cve_id=knowledge.cve_id,
+            )
+        except Exception as error:
+            verify_payload = {
+                "verify_status": "verify_self_failed",
+                "verify_error": str(error),
+            }
+        self.file_tool.write_text(
+            str(paths.build_verify_yaml),
+            yaml.safe_dump(verify_payload, sort_keys=False, allow_unicode=True),
+        )
+
         return artifact
 
     def collect_build_context(self, knowledge: KnowledgeModel, repo_path: Path, planner_attempt: int = 1) -> BuildContext:
         """Collect local build evidence from repo snapshots, patch diff, and knowledge outputs."""
 
-        patch_diff_path = Path("Dataset") / knowledge.cve_id / "vuln_data" / "vuln_diffs" / "patch.diff"
+        patch_diff_path = self._locate_patch_diff(knowledge.cve_id)
         patch_diff_text = ""
-        if patch_diff_path.exists():
+        if patch_diff_path is not None:
             patch_diff_text = patch_diff_path.read_text(encoding="utf-8", errors="replace")
         patch_affected_files = sorted(set(re.findall(r"^\+\+\+ b/(.+)$", patch_diff_text, re.MULTILINE)))
 
@@ -906,6 +926,247 @@ class BuildStage:
 
     def _sanitizer_enabled(self, build_script_content: str) -> bool:
         return "-fsanitize=" in build_script_content
+
+    def _locate_patch_diff(self, cve_id: str) -> Optional[Path]:
+        """Locate patch.diff with PoC-style dual-prefix lookup."""
+        for prefix in ("Dataset", "source/Dataset"):
+            candidate = Path(prefix) / cve_id / "vuln_data" / "vuln_diffs" / "patch.diff"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _verify_build_artifact(
+        self,
+        artifact: BuildArtifact,
+        paths: BuildStagePaths,
+        plan_meta: dict,
+        cve_id: str,
+    ) -> dict:
+        """对 build 阶段产物做事实型自检，不裁决漏洞、不影响 build_success。"""
+
+        result: dict[str, Any] = {}
+        verify_notes: list[str] = []
+
+        # 4.14 timestamp
+        result["verify_status"] = "ok"  # placeholder, updated at the end
+        result["verified_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        # 4.2 image_present / image_digest
+        try:
+            if not artifact.docker_image_tag:
+                result["image_present"] = False
+                result["image_digest"] = None
+                verify_notes.append("docker_image_tag missing in BuildArtifact")
+            else:
+                inspect_result = self.docker_tool.process_tool.run(
+                    ProcessRequest(
+                        command=["docker", "image", "inspect", artifact.docker_image_tag, "--format", "{{.Id}}"],
+                        timeout_seconds=30,
+                    )
+                )
+                if inspect_result.success:
+                    result["image_present"] = True
+                    result["image_digest"] = inspect_result.stdout.strip() or None
+                else:
+                    result["image_present"] = False
+                    result["image_digest"] = None
+        except Exception:
+            result["image_present"] = False
+            result["image_digest"] = None
+
+        # 4.3 workspace_layout_ok
+        try:
+            missing_dirs: list[str] = []
+            for directory in (paths.workspace_root, paths.repo_dir, paths.build_dir):
+                if not directory.is_dir():
+                    missing_dirs.append(str(directory))
+            result["workspace_layout_ok"] = len(missing_dirs) == 0
+            result["workspace_layout_missing"] = missing_dirs
+        except Exception:
+            result["workspace_layout_ok"] = False
+            result["workspace_layout_missing"] = []
+
+        # 4.4 dockerfile_present
+        try:
+            result["dockerfile_present"] = (
+                paths.dockerfile.exists() and paths.dockerfile.is_file() and paths.dockerfile.stat().st_size > 0
+            )
+        except Exception:
+            result["dockerfile_present"] = False
+
+        # 4.5 build_script_present
+        try:
+            result["build_script_present"] = (
+                paths.build_script.exists() and paths.build_script.is_file() and paths.build_script.stat().st_size > 0
+            )
+        except Exception:
+            result["build_script_present"] = False
+
+        # 4.6 build_log_present
+        try:
+            result["build_log_present"] = paths.build_log.exists() and paths.build_log.is_file()
+        except Exception:
+            result["build_log_present"] = False
+
+        # 4.7 image_build_success / container_run_success
+        try:
+            result["image_build_success"] = "image_build_success=True" in artifact.build_logs
+            if "container_run_success=True" in artifact.build_logs:
+                result["container_run_success"] = True
+            elif "container_run_success=False" in artifact.build_logs:
+                result["container_run_success"] = False
+            else:
+                result["container_run_success"] = None
+        except Exception:
+            result["image_build_success"] = False
+            result["container_run_success"] = None
+
+        # 4.8 binary_in_container
+        try:
+            if not artifact.expected_binary_path:
+                result["binary_in_container"] = {
+                    "checked": False,
+                    "reason": "expected_binary_path is empty",
+                }
+                verify_notes.append("expected_binary_path is empty")
+            elif not result.get("image_present"):
+                result["binary_in_container"] = {
+                    "checked": False,
+                    "reason": "image not present, cannot check binary",
+                }
+            else:
+                check_cmd = (
+                    f'test -x "${{PROJECT_DIR}}/{artifact.expected_binary_path}" '
+                    f'&& echo BINARY_FOUND || echo BINARY_MISSING'
+                )
+                bin_result = self.docker_tool.run_container(
+                    DockerRunRequest(
+                        image_tag=artifact.docker_image_tag,
+                        command=["bash", "-lc", check_cmd],
+                    )
+                )
+                log_excerpt = (bin_result.stdout + "\n" + bin_result.stderr).strip()[:800]
+                exists: Optional[bool] = None
+                if "BINARY_FOUND" in bin_result.stdout:
+                    exists = True
+                elif "BINARY_MISSING" in bin_result.stdout:
+                    exists = False
+                result["binary_in_container"] = {
+                    "checked": True,
+                    "exit_code": bin_result.exit_code,
+                    "exists": exists,
+                    "expected_path": artifact.expected_binary_path,
+                    "log_excerpt": log_excerpt,
+                }
+        except Exception:
+            result["binary_in_container"] = {
+                "checked": False,
+                "reason": "exception during binary check",
+            }
+
+        # 4.9 patch_appliable_in_container
+        try:
+            patch_diff_path = self._locate_patch_diff(cve_id)
+            if patch_diff_path is None:
+                result["patch_appliable_in_container"] = {
+                    "checked": False,
+                    "reason": "patch.diff not found",
+                }
+                verify_notes.append("patch.diff not found")
+            elif not result.get("image_present"):
+                result["patch_appliable_in_container"] = {
+                    "checked": False,
+                    "reason": "image not present, cannot check patch",
+                }
+            else:
+                patch_diff_host_path = str(patch_diff_path.resolve())
+                command = [
+                    "docker", "run", "--rm",
+                    "-v", f"{patch_diff_host_path}:/tmp/patch.diff:ro",
+                    artifact.docker_image_tag,
+                    "bash", "-lc",
+                    'cd "${PROJECT_DIR}" && git apply --check /tmp/patch.diff',
+                ]
+                patch_result = self.docker_tool.process_tool.run(
+                    ProcessRequest(command=command, timeout_seconds=120)
+                )
+                log_excerpt = (patch_result.stdout + "\n" + patch_result.stderr).strip()[:1200]
+                result["patch_appliable_in_container"] = {
+                    "checked": True,
+                    "applied": patch_result.success,
+                    "exit_code": patch_result.exit_code,
+                    "patch_diff_path": str(patch_diff_path),
+                    "log_excerpt": log_excerpt,
+                }
+        except Exception:
+            result["patch_appliable_in_container"] = {
+                "checked": False,
+                "reason": "exception during patch check",
+            }
+
+        # 4.11 repo_ref_in_container
+        try:
+            if not result.get("image_present"):
+                result["repo_ref_in_container"] = {
+                    "checked": False,
+                    "reason": "image not present, cannot check ref",
+                }
+            else:
+                ref_result = self.docker_tool.run_container(
+                    DockerRunRequest(
+                        image_tag=artifact.docker_image_tag,
+                        command=["bash", "-lc", 'cd "${PROJECT_DIR}" && git rev-parse HEAD'],
+                    )
+                )
+                observed_head = ref_result.stdout.strip()
+                expected_ref = artifact.chosen_vulnerable_ref
+                matches: Optional[bool] = None
+                if expected_ref and len(expected_ref) >= 7 and re.fullmatch(r"[0-9a-fA-F]+", expected_ref):
+                    matches = observed_head.startswith(expected_ref) or expected_ref.startswith(observed_head)
+                result["repo_ref_in_container"] = {
+                    "checked": True,
+                    "expected_ref": expected_ref,
+                    "observed_head": observed_head,
+                    "matches": matches,
+                    "exit_code": ref_result.exit_code,
+                }
+        except Exception:
+            result["repo_ref_in_container"] = {
+                "checked": False,
+                "reason": "exception during ref check",
+            }
+
+        # 4.12 verify_notes
+        result["verify_notes"] = verify_notes
+
+        # 4.13 verify_status
+        must_pass = [
+            result.get("image_present"),
+            result.get("workspace_layout_ok"),
+            result.get("dockerfile_present"),
+            result.get("build_script_present"),
+            result.get("build_log_present"),
+        ]
+
+        if artifact.build_success:
+            must_pass.append(result.get("image_build_success"))
+            must_pass.append(result.get("container_run_success"))
+
+        if artifact.expected_binary_path and artifact.build_success:
+            bin_info = result.get("binary_in_container", {})
+            if bin_info.get("checked"):
+                must_pass.append(bin_info.get("exists"))
+
+        patch_info = result.get("patch_appliable_in_container", {})
+        if patch_info.get("checked"):
+            must_pass.append(patch_info.get("applied"))
+
+        if all(item is True for item in must_pass):
+            result["verify_status"] = "ok"
+        else:
+            result["verify_status"] = "partial"
+
+        return result
 
 
 def build_node(state):
