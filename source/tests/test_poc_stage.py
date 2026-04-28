@@ -253,3 +253,57 @@ def test_poc_node_records_retry_on_unsuccessful_execution(monkeypatch):
     assert result["poc"].execution_success is False
     assert result["retry_count"]["poc"] == 1
     assert result["stage_history"][-1]["status"] == "failed"
+
+
+def test_poc_artifact_persists_plan_fields_for_verify(tmp_path):
+    """Fix 2-3.A: env vars / expected_stack_keywords / expected_crash_type
+    must be copied from PocPlan into PoCArtifact so verify can consume them."""
+
+    class FakeDockerTool:
+        def build_image(self, request):
+            class Result:
+                success = True
+                exit_code = 0
+                stdout = "built"
+                stderr = ""
+
+            return Result()
+
+        def run_container(self, request):
+            class Result:
+                success = True
+                exit_code = 0
+                stdout = (
+                    "target_binary=demo\ntrigger_command=demo poc\n"
+                    "execution_exit_code=0\n"
+                    "stdout_begin\nok\nstdout_end\n"
+                    "stderr_begin\n\nstderr_end\n"
+                )
+                stderr = ""
+
+            return Result()
+
+    stage = poc_module.PocStage(docker_tool=FakeDockerTool())
+    paths = poc_module.PocStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    paths.repo_dir.mkdir(parents=True, exist_ok=True)
+
+    plan = poc_module.PocPlan(
+        target_binary="demo",
+        payload_filename="poc.txt",
+        payload_content="boom\n",
+        run_command="demo /workspace/artifacts/poc/payloads/poc.txt",
+        expected_stack_keywords=["singlevar"],
+        expected_crash_type="heap-buffer-overflow",
+        environment_variables={"ASAN_OPTIONS": "detect_leaks=0"},
+    )
+
+    artifact = stage._execute_poc_plan(
+        paths=paths,
+        plan_meta={"docker_image_tag": "demo:poc", "base_image_tag": "demo:build"},
+        plan=plan,
+    )
+
+    assert artifact.environment_variables == {"ASAN_OPTIONS": "detect_leaks=0"}
+    assert artifact.expected_stack_keywords == ["singlevar"]
+    assert artifact.expected_crash_type == "heap-buffer-overflow"

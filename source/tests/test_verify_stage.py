@@ -200,7 +200,7 @@ def test_short_circuit_when_run_verify_ineligible(tmp_path):
     result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
 
     assert result.verdict == "inconclusive"
-    assert result.reason.startswith("poc_run_verify_ineligible")
+    assert result.reason.startswith("short_circuit:poc_run_verify_ineligible")
     assert fake_docker.run_container.call_count == 0
     assert paths.verify_result_yaml.exists()
 
@@ -325,3 +325,323 @@ def test_route_after_verify_three_way():
     assert routers.route_after_verify(failed_state) == "failed"
     assert routers.route_after_verify(inconclusive_state) == "inconclusive"
     assert routers.route_after_verify(none_state) == "failed"
+
+
+# ===== Fix 1: build_rebuild failure detection =====
+def test_decide_verdict_inconclusive_when_post_rebuild_failed():
+    stage = verify_module.VerifyStage()
+    pre = make_pass(
+        exit_code=139,
+        crash_type="heap-buffer-overflow",
+        matched_error_patterns=["heap-buffer-overflow"],
+        matched_stack_keywords=["singlevar"],
+        build_rebuild_exit_code=0,
+    )
+    post = make_pass(
+        exit_code=255,
+        crash_type="",
+        matched_error_patterns=[],
+        matched_stack_keywords=[],
+        patch_apply_exit_code=0,
+        build_rebuild_exit_code=2,
+    )
+    context = make_context()
+
+    result = stage._decide_verdict({"pre": pre, "post": post}, context)
+
+    assert result.verdict == "inconclusive"
+    assert result.reason.startswith("post_rebuild_failed")
+    # 关键：pre 真实命中，必须如实回填，不能因为 post 失败就清零
+    assert result.pre_patch_triggered is True
+
+
+def test_decide_verdict_inconclusive_when_pre_rebuild_failed():
+    stage = verify_module.VerifyStage()
+    pre = make_pass(
+        exit_code=255,
+        matched_error_patterns=[],
+        build_rebuild_exit_code=1,
+    )
+    post = make_pass(
+        exit_code=0,
+        matched_error_patterns=[],
+        patch_apply_exit_code=0,
+        build_rebuild_exit_code=0,
+    )
+    context = make_context()
+
+    result = stage._decide_verdict({"pre": pre, "post": post}, context)
+
+    assert result.verdict == "inconclusive"
+    assert result.reason.startswith("pre_rebuild_failed")
+
+
+# ===== Fix 2-3.B: collect_verify_context uses PoC plan fields =====
+def test_collect_verify_context_uses_poc_plan_fields(tmp_path):
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.poc_dir.mkdir(parents=True, exist_ok=True)
+
+    knowledge = KnowledgeModel(
+        cve_id="CVE-2022-0000",
+        summary="demo",
+        vulnerability_type="heap-overflow",
+        repo_url="https://example.com/demo.git",
+        vulnerable_ref="abc1234",
+        expected_stack_keywords=["knowledge_keyword"],
+    )
+    build = BuildArtifact(
+        dockerfile_content="FROM ubuntu\n",
+        build_script_content="#!/bin/bash\n",
+        build_success=True,
+        docker_image_tag="demo:build",
+        chosen_vulnerable_ref="abc1234",
+        chosen_fixed_ref="fff5678",
+        binary_or_entrypoint="src/lua",
+    )
+    poc = PoCArtifact(
+        poc_filename="poc.lua",
+        poc_content="boom",
+        run_script_content="#!/bin/bash\n",
+        target_binary="src/lua",
+        trigger_command="src/lua poc.lua",
+        execution_success=True,
+        expected_stack_keywords=["singlevar"],
+        expected_crash_type="heap-buffer-overflow",
+        environment_variables={"ASAN_OPTIONS": "detect_leaks=0"},
+    )
+    stage = verify_module.VerifyStage()
+
+    context = stage.collect_verify_context(knowledge, build, poc, paths)
+
+    assert context.expected_stack_keywords == ["singlevar"]
+    assert context.expected_crash_type == "heap-buffer-overflow"
+    assert context.environment_variables == {"ASAN_OPTIONS": "detect_leaks=0"}
+
+
+def test_collect_verify_context_falls_back_to_knowledge_when_poc_keywords_empty(tmp_path):
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.poc_dir.mkdir(parents=True, exist_ok=True)
+
+    knowledge = KnowledgeModel(
+        cve_id="CVE-2022-0000",
+        summary="demo",
+        vulnerability_type="heap-overflow",
+        expected_stack_keywords=["foo"],
+    )
+    build = BuildArtifact(
+        dockerfile_content="FROM ubuntu\n",
+        build_script_content="#!/bin/bash\n",
+        build_success=True,
+        docker_image_tag="demo:build",
+    )
+    poc = PoCArtifact(
+        poc_filename="poc.lua",
+        poc_content="boom",
+        run_script_content="#!/bin/bash\n",
+    )
+    stage = verify_module.VerifyStage()
+
+    context = stage.collect_verify_context(knowledge, build, poc, paths)
+
+    assert context.expected_stack_keywords == ["foo"]
+
+
+# ===== Fix 2-3.C: env vars propagated to docker call =====
+def test_run_one_pass_propagates_environment_variables(tmp_path):
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.verify_dir.mkdir(parents=True, exist_ok=True)
+
+    captured = {}
+
+    def fake_run_container(request):
+        captured["request"] = request
+        result = MagicMock()
+        result.stdout = (
+            "build_rebuild_exit_code=0\n"
+            "target_binary=src/lua\n"
+            "execution_exit_code=0\n"
+            "stdout_begin\n\nstdout_end\n"
+            "stderr_begin\n\nstderr_end\n"
+        )
+        result.stderr = ""
+        result.exit_code = 0
+        result.success = True
+        return result
+
+    fake_docker = MagicMock()
+    fake_docker.run_container = fake_run_container
+    stage = verify_module.VerifyStage(docker_tool=fake_docker)
+
+    context = make_context()
+    plan = verify_module.VerifyPlan(
+        image_tag="demo:build",
+        pre_run_command="src/lua poc.lua",
+        post_run_command="src/lua poc.lua",
+        environment_variables={"ASAN_OPTIONS": "detect_leaks=0"},
+        pre_log_path=str(paths.pre_patch_log),
+        post_log_path=str(paths.post_patch_log),
+    )
+
+    stage._run_one_pass("pre", context, plan, paths)
+    env = captured["request"].environment
+    assert env.get("ASAN_OPTIONS") == "detect_leaks=0"
+    assert env.get("PATCH_MODE") == "pre"
+
+
+# ===== Fix 4.B: dataset_root flows through =====
+def test_collect_verify_context_uses_dataset_root(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.poc_dir.mkdir(parents=True, exist_ok=True)
+
+    custom_root = tmp_path / "custom_dataset"
+    target = custom_root / "CVE-2022-0000" / "vuln_data" / "vuln_diffs" / "patch.diff"
+    target.parent.mkdir(parents=True)
+    target.write_text("--- a\n+++ b\n", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+
+    knowledge = KnowledgeModel(
+        cve_id="CVE-2022-0000",
+        summary="demo",
+        vulnerability_type="heap-overflow",
+    )
+    build = BuildArtifact(
+        dockerfile_content="FROM ubuntu\n",
+        build_script_content="#!/bin/bash\n",
+        build_success=True,
+        docker_image_tag="demo:build",
+    )
+    poc = PoCArtifact(
+        poc_filename="poc.lua",
+        poc_content="boom",
+        run_script_content="#!/bin/bash\n",
+    )
+    stage = verify_module.VerifyStage()
+
+    context = stage.collect_verify_context(
+        knowledge, build, poc, paths, dataset_root=str(custom_root)
+    )
+
+    assert context.patch_diff_path == str(target)
+
+
+# ===== Fix 5.A/B: _resolve_project_dir =====
+def test_resolve_project_dir_from_absolute_binary_path():
+    stage = verify_module.VerifyStage()
+    build = BuildArtifact(
+        dockerfile_content="x",
+        build_script_content="y",
+        binary_or_entrypoint="/opt/lua-5.4.4/src/lua",
+    )
+    assert stage._resolve_project_dir(build) == "/opt/lua-5.4.4"
+
+
+def test_resolve_project_dir_falls_back_to_env_var():
+    stage = verify_module.VerifyStage()
+    build_relative = BuildArtifact(
+        dockerfile_content="x",
+        build_script_content="y",
+        binary_or_entrypoint="src/lua",
+    )
+    build_empty = BuildArtifact(
+        dockerfile_content="x",
+        build_script_content="y",
+        binary_or_entrypoint="",
+    )
+    assert stage._resolve_project_dir(build_relative) == "${PROJECT_DIR}"
+    assert stage._resolve_project_dir(build_empty) == "${PROJECT_DIR}"
+
+
+# ===== Fix 5.C: template uses resolved project dir =====
+def test_verify_run_template_uses_resolved_project_dir():
+    stage = verify_module.VerifyStage()
+    rendered = stage._render_template(
+        "verify_run.sh.j2",
+        {
+            "target_binary": "src/lua",
+            "run_command": "src/lua poc.lua",
+            "repo_reset_command": "git reset --hard && git clean -fd",
+            "rebuild_command": "bash /workspace/artifacts/build/build.sh",
+            "patch_apply_command": "git apply /workspace/artifacts/verify/patch.diff",
+            "project_dir_var": "/opt/lua-5.4.4",
+        },
+    )
+    assert 'PROJECT_DIR_VAR="/opt/lua-5.4.4"' in rendered
+
+
+# ===== Fix 6.A/B: patch_apply_log extraction =====
+def test_extract_patch_apply_log_uses_dedicated_block():
+    stage = verify_module.VerifyStage()
+    log = (
+        "noise above\n"
+        "patch_apply_exit_code=1\n"
+        "patch_apply_stderr_begin\n"
+        "error: patch failed: src/lua.c:123\n"
+        "error: src/lua.c: patch does not apply\n"
+        "patch_apply_stderr_end\n"
+        "more noise\n"
+    )
+    result = stage._extract_patch_apply_log(log)
+    assert "patch failed: src/lua.c:123" in result
+    assert "patch does not apply" in result
+
+
+def test_extract_patch_apply_log_falls_back_to_legacy_radius():
+    stage = verify_module.VerifyStage()
+    log = (
+        "some preamble\n"
+        "patch_apply_exit_code=1\n"
+        "some_other_marker=value\n"
+    )
+    result = stage._extract_patch_apply_log(log)
+    assert "patch_apply_exit_code=1" in result
+
+
+# ===== Fix 7: short_circuit prefix vs real-run no-prefix =====
+def test_short_circuit_reason_carries_prefix(tmp_path):
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.poc_dir.mkdir(parents=True, exist_ok=True)
+    paths.run_verify_yaml.write_text(
+        yaml.safe_dump(
+            {"eligible_for_verify": False, "eligibility_reason": "no_target_behavior_observed"}
+        ),
+        encoding="utf-8",
+    )
+
+    knowledge = KnowledgeModel(
+        cve_id="CVE-2022-0000",
+        summary="demo",
+        vulnerability_type="heap-overflow",
+    )
+    build = BuildArtifact(
+        dockerfile_content="x",
+        build_script_content="y",
+        build_success=True,
+        docker_image_tag="demo:build",
+    )
+    poc = PoCArtifact(
+        poc_filename="poc.lua",
+        poc_content="boom",
+        run_script_content="#!/bin/bash\n",
+    )
+    stage = verify_module.VerifyStage()
+    result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=str(workspace))
+
+    assert result.reason.startswith("short_circuit:")
+
+
+def test_real_run_failed_reason_has_no_prefix():
+    stage = verify_module.VerifyStage()
+    pre = make_pass(exit_code=0, matched_error_patterns=[], matched_stack_keywords=[])
+    post = make_pass(exit_code=0, patch_apply_exit_code=0)
+    context = make_context()
+    result = stage._decide_verdict({"pre": pre, "post": post}, context)
+
+    assert result.verdict == "failed"
+    assert result.reason == "pre_not_triggered"
+    assert not result.reason.startswith("short_circuit:")

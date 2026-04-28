@@ -88,7 +88,13 @@ def main() -> int:
 
     knowledge, build, poc, workspace = load_inputs(args.cve_id, args.dataset_root, args.workspace_root)
     stage = VerifyStage()
-    result = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=workspace)
+    result = stage.run(
+        knowledge=knowledge,
+        build=build,
+        poc=poc,
+        workspace=workspace,
+        dataset_root=args.dataset_root,
+    )
     paths = VerifyStagePaths(workspace)
 
     print(f"Verify stage completed for {args.cve_id}.")

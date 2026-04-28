@@ -92,6 +92,10 @@ class VerifyContext(BaseModel):
     patch_diff_path: str
     poc_run_verify_eligible: bool = True
     poc_run_verify_reason: str = ""
+    environment_variables: Dict[str, str] = Field(
+        default_factory=dict,
+        description="PoC 持久化的环境变量；verify 必须复用",
+    )
 
 
 class VerifyPlan(BaseModel):
@@ -133,12 +137,15 @@ class VerifyStage:
         build: BuildArtifact,
         poc: PoCArtifact,
         workspace: str,
+        dataset_root: Optional[str] = None,
     ) -> VerifyResult:
         paths = VerifyStagePaths(workspace)
         self.file_tool.ensure_dir(str(paths.verify_dir))
 
         try:
-            context = self.collect_verify_context(knowledge, build, poc, paths)
+            context = self.collect_verify_context(
+                knowledge, build, poc, paths, dataset_root=dataset_root
+            )
         except Exception as error:
             return self._stage_exception("collect_verify_context", error, paths)
 
@@ -199,31 +206,63 @@ class VerifyStage:
         build: BuildArtifact,
         poc: PoCArtifact,
         paths: VerifyStagePaths,
+        dataset_root: Optional[str] = None,
     ) -> VerifyContext:
         """Collect evidence for verify planning."""
 
-        patch_diff = find_patch_diff(knowledge.cve_id)
+        search_roots = [dataset_root] if dataset_root else None
+        patch_diff = find_patch_diff(knowledge.cve_id, search_roots=search_roots)
         patch_diff_path = str(patch_diff) if patch_diff is not None else ""
 
         eligible, reason = self._read_run_verify_yaml(paths)
+
+        # PoC plan fields with backward-compatible fallbacks
+        expected_stack_keywords = list(poc.expected_stack_keywords) or list(knowledge.expected_stack_keywords)
+        expected_crash_type = poc.expected_crash_type or self._infer_crash_type_fallback(poc)
+        environment_variables = dict(poc.environment_variables)
 
         return VerifyContext(
             cve_id=knowledge.cve_id,
             docker_image_tag=build.docker_image_tag or "",
             chosen_vulnerable_ref=build.chosen_vulnerable_ref or "",
             chosen_fixed_ref=build.chosen_fixed_ref or "",
-            project_dir_inside_image="",  # 留空，模板内用 ${PROJECT_DIR}
+            project_dir_inside_image=self._resolve_project_dir(build),
+            build_script_in_image="/workspace/artifacts/build/build.sh",
             target_binary=poc.target_binary or build.binary_or_entrypoint or build.expected_binary_path or "",
             trigger_command=poc.trigger_command or "",
             expected_stdout_patterns=list(poc.expected_stdout_patterns),
             expected_stderr_patterns=list(poc.expected_stderr_patterns),
-            expected_stack_keywords=list(knowledge.expected_stack_keywords),
+            expected_stack_keywords=expected_stack_keywords,
             expected_exit_code=poc.expected_exit_code,
-            expected_crash_type=poc.observed_crash_type or "",
+            expected_crash_type=expected_crash_type,
             patch_diff_path=patch_diff_path,
             poc_run_verify_eligible=eligible,
             poc_run_verify_reason=reason,
+            environment_variables=environment_variables,
         )
+
+    def _infer_crash_type_fallback(self, poc: PoCArtifact) -> str:
+        """Fallback for legacy poc_artifact.yaml that lacks expected_crash_type."""
+        return poc.observed_crash_type or ""
+
+    def _resolve_project_dir(self, build: BuildArtifact) -> str:
+        """Determine the in-container project directory.
+
+        优先级：
+          1. BuildArtifact.binary_or_entrypoint 反推（取上 2 层目录），如果它是绝对路径
+             例如 /opt/lua-5.4.4/src/lua → /opt/lua-5.4.4
+          2. 默认 ${PROJECT_DIR}（依赖镜像导出此环境变量）
+
+        返回的是要写到 verify_run.sh 里的"取值表达式"。
+        """
+        binary = (build.binary_or_entrypoint or "").strip()
+        if binary.startswith("/"):
+            parts = binary.rstrip("/").split("/")
+            if len(parts) >= 4:
+                inferred = "/".join(parts[:-2])
+                if inferred:
+                    return inferred
+        return "${PROJECT_DIR}"
 
     def plan_verify(self, context: VerifyContext, paths: VerifyStagePaths) -> VerifyPlan:
         """Build a deterministic pre/post execution plan."""
@@ -236,7 +275,7 @@ class VerifyStage:
             image_tag=context.docker_image_tag,
             pre_run_command=context.trigger_command,
             post_run_command=context.trigger_command,
-            environment_variables={},
+            environment_variables=dict(context.environment_variables),
             expected_stdout_patterns=list(context.expected_stdout_patterns),
             expected_stderr_patterns=list(context.expected_stderr_patterns),
             expected_stack_keywords=list(context.expected_stack_keywords),
@@ -264,32 +303,38 @@ class VerifyStage:
         patch_apply_exit_code = post.get("patch_apply_exit_code")
         patch_apply_success = patch_apply_exit_code == 0
         if patch_apply_exit_code is not None and not patch_apply_success:
-            return self._build_result(
-                pre=pre,
-                post=post,
-                verdict="inconclusive",
+            return self._build_inconclusive_result(
+                pre, post, context,
                 reason=f"patch_apply_failed: exit_code={patch_apply_exit_code}",
-                confidence="low",
                 evidence_summary="post mode failed at git apply step; pre/post comparison skipped.",
-                patch_apply_success=False,
-                pre_triggered=False,
-                post_clean=False,
+            )
+
+        # build rebuild 失败 → inconclusive
+        # pre 失败：漏洞态没办法执行 trigger
+        # post 失败：patch 后无法编译，post_clean 不可信
+        pre_rebuild = pre.get("build_rebuild_exit_code")
+        if pre_rebuild is not None and pre_rebuild != 0:
+            return self._build_inconclusive_result(
+                pre, post, context,
+                reason=f"pre_rebuild_failed: exit_code={pre_rebuild}",
+                evidence_summary="Vulnerable rebuild failed; trigger never executed in pre mode.",
+            )
+        post_rebuild = post.get("build_rebuild_exit_code")
+        if post_rebuild is not None and post_rebuild != 0:
+            return self._build_inconclusive_result(
+                pre, post, context,
+                reason=f"post_rebuild_failed: exit_code={post_rebuild}",
+                evidence_summary="Patched rebuild failed; post-patch trigger result is not trustworthy.",
             )
 
         # 任何一次脚本不 well_formed → inconclusive
         if not pre.get("log_well_formed") or not post.get("log_well_formed"):
-            return self._build_result(
-                pre=pre,
-                post=post,
-                verdict="inconclusive",
+            return self._build_inconclusive_result(
+                pre, post, context,
                 reason="log_not_well_formed: pre={}, post={}".format(
                     pre.get("log_well_formed"), post.get("log_well_formed")
                 ),
-                confidence="low",
                 evidence_summary="At least one pass produced an incomplete log; cannot compare reliably.",
-                patch_apply_success=patch_apply_success,
-                pre_triggered=False,
-                post_clean=False,
             )
 
         # pre / post 触发判定
@@ -316,10 +361,11 @@ class VerifyStage:
             confidence = "medium"
             evidence_summary = "post mode still showed trigger signals after applying patch."
         else:
-            verdict = "inconclusive"
-            reason = "unexpected_state"
-            confidence = "low"
-            evidence_summary = "Decision logic reached an unexpected branch."
+            return self._build_inconclusive_result(
+                pre, post, context,
+                reason="unexpected_state",
+                evidence_summary="Decision logic reached an unexpected branch.",
+            )
 
         return self._build_result(
             pre=pre,
@@ -354,7 +400,9 @@ class VerifyStage:
                 "target_binary": context.target_binary,
                 "run_command": plan.pre_run_command,
                 "repo_reset_command": plan.repo_reset_command,
-                "rebuild_command": plan.rebuild_command,
+                # Prefer context.build_script_in_image (a typed field) over plan.rebuild_command
+                # (a string default) so future build-stage changes only need to update one place.
+                "rebuild_command": f"bash {context.build_script_in_image}",
                 "patch_apply_command": plan.patch_apply_command,
                 "project_dir_var": context.project_dir_inside_image or "${PROJECT_DIR}",
             },
@@ -379,11 +427,13 @@ class VerifyStage:
     ) -> dict:
         """Run verify_run.sh once with PATCH_MODE=mode and return parsed observation."""
 
+        env = dict(plan.environment_variables)
+        env["PATCH_MODE"] = mode
         request = DockerRunRequest(
             image_tag=plan.image_tag,
             command=["bash", "/workspace/artifacts/verify/verify_run.sh"],
             workspace=str(paths.workspace_root.resolve()),
-            environment={"PATCH_MODE": mode},
+            environment=env,
         )
         docker_result = self.docker_tool.run_container(request)
         full_log = self._compose_pass_log(docker_result, mode, request)
@@ -458,7 +508,7 @@ class VerifyStage:
                 pre_patch_triggered=False,
                 post_patch_clean=False,
                 verdict="inconclusive",
-                reason=f"poc_run_verify_ineligible: {context.poc_run_verify_reason}",
+                reason=f"short_circuit:poc_run_verify_ineligible: {context.poc_run_verify_reason}",
                 confidence="low",
                 evidence_summary="Skipped pre/post execution because PoC run_verify reported ineligible.",
             )
@@ -467,7 +517,7 @@ class VerifyStage:
                 pre_patch_triggered=False,
                 post_patch_clean=False,
                 verdict="inconclusive",
-                reason="patch_diff_not_found",
+                reason="short_circuit:patch_diff_not_found",
                 confidence="low",
                 evidence_summary="Skipped pre/post execution because patch.diff is unavailable.",
             )
@@ -476,7 +526,7 @@ class VerifyStage:
                 pre_patch_triggered=False,
                 post_patch_clean=False,
                 verdict="inconclusive",
-                reason="docker_image_tag_missing_in_build_artifact",
+                reason="short_circuit:docker_image_tag_missing_in_build_artifact",
                 confidence="low",
                 evidence_summary="Skipped pre/post execution because BuildArtifact has no docker_image_tag.",
             )
@@ -512,6 +562,63 @@ class VerifyStage:
             return "medium"
         return "low"
 
+    def _build_inconclusive_result(
+        self,
+        pre: dict,
+        post: dict,
+        context: VerifyContext,
+        reason: str,
+        evidence_summary: str,
+    ) -> VerifyResult:
+        """Construct an inconclusive VerifyResult with all pre/post fields populated.
+
+        pre/post 的 triggered/clean 状态忠实反映各自数据，不因为 inconclusive 就清零——
+        这样上游分析可以看到"虽然 verify 拿不准，但 pre 实际上确实命中了"等细节。
+        """
+
+        pre_triggered = self._is_triggered(pre, context)
+        post_triggered = self._is_triggered(post, context)
+        post_clean = not post_triggered
+
+        patch_apply_exit_code = post.get("patch_apply_exit_code")
+        if patch_apply_exit_code is None:
+            patch_apply_success = False
+        else:
+            patch_apply_success = (patch_apply_exit_code == 0)
+
+        return self._build_result(
+            pre=pre,
+            post=post,
+            verdict="inconclusive",
+            reason=reason,
+            confidence="low",
+            evidence_summary=evidence_summary,
+            patch_apply_success=patch_apply_success,
+            pre_triggered=pre_triggered,
+            post_clean=post_clean,
+        )
+
+    def _extract_lines_around_marker(self, log: str, marker: str, radius: int = 5) -> str:
+        """Return ±radius lines around the first line that starts with marker."""
+
+        if marker not in log:
+            return ""
+        lines = log.splitlines()
+        for idx, line in enumerate(lines):
+            if line.startswith(marker):
+                start = max(0, idx - radius)
+                end = min(len(lines), idx + radius)
+                return "\n".join(lines[start:end])
+        return ""
+
+    def _extract_patch_apply_log(self, full_log: str) -> str:
+        """Extract the patch_apply_stderr block; fall back to ±5 lines around the marker."""
+
+        block = extract_block(full_log, "patch_apply_stderr_begin", "patch_apply_stderr_end")
+        if block.strip():
+            return block
+        return self._extract_lines_around_marker(full_log, "patch_apply_exit_code=", radius=5)
+
     def _build_result(
         self,
         pre: dict,
@@ -529,18 +636,7 @@ class VerifyStage:
         post_matched_error = list(post.get("matched_error_patterns") or [])
         post_matched_stack = list(post.get("matched_stack_keywords") or [])
 
-        # patch_apply_log: take a short excerpt
-        patch_apply_log = ""
-        post_raw_log = post.get("raw_log") or ""
-        if "patch_apply_exit_code=" in post_raw_log:
-            # capture surrounding lines for context
-            lines = post_raw_log.splitlines()
-            for idx, line in enumerate(lines):
-                if line.startswith("patch_apply_exit_code="):
-                    start = max(0, idx - 5)
-                    end = min(len(lines), idx + 5)
-                    patch_apply_log = "\n".join(lines[start:end])
-                    break
+        patch_apply_log = self._extract_patch_apply_log(post.get("raw_log") or "")
 
         return VerifyResult(
             pre_patch_triggered=pre_triggered,

@@ -4,21 +4,35 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from pydantic import BaseModel, Field
 
 
-def find_patch_diff(cve_id: str) -> Optional[Path]:
-    """Locate patch.diff with dual-prefix lookup.
+def find_patch_diff(
+    cve_id: str,
+    search_roots: Optional[Iterable[str]] = None,
+) -> Optional[Path]:
+    """Locate patch.diff with configurable search roots.
 
-    Searches in this order:
-      1. Dataset/<cve_id>/vuln_data/vuln_diffs/patch.diff
-      2. source/Dataset/<cve_id>/vuln_data/vuln_diffs/patch.diff
+    Search order:
+      1. Each entry in search_roots (in order, if provided)
+      2. Default fallback: ["Dataset", "source/Dataset"]
 
-    Returns None if neither exists.
+    Default prefixes always remain as a fallback so existing call sites
+    (build / poc) keep working when search_roots is None.
+
+    Returns None if no candidate exists.
     """
-    for prefix in ("Dataset", "source/Dataset"):
+
+    candidates: list[str] = []
+    if search_roots:
+        candidates.extend(search_roots)
+    for default in ("Dataset", "source/Dataset"):
+        if default not in candidates:
+            candidates.append(default)
+
+    for prefix in candidates:
         candidate = Path(prefix) / cve_id / "vuln_data" / "vuln_diffs" / "patch.diff"
         if candidate.exists():
             return candidate
