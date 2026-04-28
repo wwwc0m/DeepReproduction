@@ -248,6 +248,79 @@ Build 阶段成功后，重点检查：
 8. `workspaces/<CVE>/artifacts/build/build_artifact.yaml`
    - 记录最终构建状态和确认后的构建事实
 
+## Verify 阶段测试方法
+
+前提：
+
+- knowledge 阶段已经跑过：`../Dataset/<CVE>/vuln_yaml/knowledge.yaml` 已存在
+- build 阶段已经跑过：`workspaces/<CVE>/artifacts/build/build_artifact.yaml` 已存在，且对应的 Docker 镜像已构建（镜像 tag 即 `BuildArtifact.docker_image_tag`）
+- poc 阶段已经跑过：`workspaces/<CVE>/artifacts/poc/poc_artifact.yaml` 已存在；如果还产出了 `run_verify.yaml`，verify 阶段会读取其中的 `eligible_for_verify` 做短路判断
+
+当前 verify 阶段的独立测试入口是：
+
+```bash
+pdm run python scripts/run_verify.py CVE-2022-28805 --dataset-root ../Dataset --workspace-root workspaces
+```
+
+该命令会：
+
+1. 从前序阶段的产物读取 `KnowledgeModel` / `BuildArtifact` / `PoCArtifact`
+2. 短路检查：如果 `run_verify.yaml.eligible_for_verify` 为 false，或 patch.diff 找不到，或 image tag 缺失 → 直接判 `inconclusive`，不跑 docker
+3. 渲染 `verify.Dockerfile`、`verify_run.sh`，把 patch.diff 拷贝到 `workspaces/<CVE>/artifacts/verify/patch.diff`
+4. 执行两次独立的 docker run（环境变量 `PATCH_MODE=pre|post`），共用同一镜像
+5. 解析两次执行的日志，比较 pre/post 行为
+6. 落盘 `verify_result.yaml`
+
+Verify 阶段成功后，重点检查 `workspaces/<CVE>/artifacts/verify/` 下：
+
+1. `verify_context.yaml` — 收集到的本地证据
+2. `verify_plan.yaml` — 渲染前的执行计划
+3. `Dockerfile`、`verify_run.sh`、`patch.diff` — 实际执行用的产物
+4. `pre_patch.log`、`post_patch.log` — 两次容器运行的完整日志
+5. `verify_result.yaml` — 最终判定结果
+
+`verify_result.yaml` 关键字段：
+
+- `verdict`：`success` | `failed` | `inconclusive`
+- `confidence`：`high` | `medium` | `low`
+- `pre_patch_triggered` / `post_patch_clean`：核心比对结论
+- `patch_apply_success`：post 模式下 `git apply` 是否成功
+
+三态语义：
+
+- `success`：pre 触发 + post 不触发，复现闭环
+- `failed`：`pre_not_triggered`（PoC 在漏洞态没打到目标行为）或 `post_still_triggered`（patch 没修复）
+- `inconclusive`：`patch_apply_failed`（patch 在镜像里打不上）/ `log_not_well_formed`（脚本输出不完整）/ `poc_run_verify_ineligible`（PoC 自己说不合格）/ `stage_exception`（verify 本身异常）
+
+### verdict=inconclusive 的两类来源
+
+inconclusive 不是失败，而是"无法给出可信结论"。它有两种来源，通过 `reason` 字段前缀区分：
+
+#### 来源 A：短路（reason 以 `short_circuit:` 开头）
+
+verify 在跑 docker 之前就判定无法继续。常见情况：
+
+- `short_circuit:poc_run_verify_ineligible:*`：上游 PoC 阶段的 `run_verify.yaml` 报告 `eligible_for_verify=false`，verify 信任这个判断不再浪费 docker
+- `short_circuit:patch_diff_not_found`：dataset 里没有 patch.diff，verify 无法做差分对比
+- `short_circuit:docker_image_tag_missing_in_build_artifact`：build 阶段没产出可用镜像
+
+短路的语义是"PoC 或 build 阶段的产物不足以让 verify 给出结论"。修复方向通常在上游阶段。
+
+#### 来源 B：真跑后无法判定（reason 不带前缀）
+
+verify 真的跑了 pre/post，但跑出来的结果本身就拿不准：
+
+- `pre_rebuild_failed:*` / `post_rebuild_failed:*`：在容器内重新编译失败。post 失败时 patch 后无法运行 trigger，无法判定 post_clean
+- `patch_apply_failed:*`：post 模式 git apply 失败，整个差分对比的前提不成立
+- `log_not_well_formed:*`：脚本输出不符合契约，可能是镜像内 bash 异常或脚本被截断
+- `verify_node_exception:*`：阶段自身抛了未捕获异常
+
+来源 B 的语义是"verify 自己跑了，但执行环境出了问题"。修复方向通常在 verify 模板或镜像配置。
+
+#### 与 verdict=failed 的区别
+
+`failed` 表示"verify 跑完了，结果证明漏洞没复现"——典型场景是 `reason=pre_not_triggered`（漏洞镜像里跑 PoC 没触发）或 `reason=post_still_triggered`（patch 后 PoC 仍然触发）。这两种是验证流程本身的真实负面结论，不是流程异常。
+
 ## 如何判断大模型是否生效
 
 查看：
