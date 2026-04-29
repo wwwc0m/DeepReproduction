@@ -57,6 +57,34 @@ def test_heuristic_build_plan_prefers_fixed_parent():
     assert plan.build_system == "make"
 
 
+def test_build_fallback_spec_centralizes_heuristic_defaults():
+    stage = build_module.BuildStage()
+    knowledge = make_knowledge(
+        install_commands=["apt-get install zlib openssl"],
+        fixed_ref="feedface",
+    )
+    context = build_module.BuildContext(
+        cve_id=knowledge.cve_id,
+        repo_url=knowledge.repo_url or "",
+        snapshots=[
+            build_module.RefSnapshot(
+                label="fixed_parent",
+                requested_ref="beadfeed",
+                resolved_ref="beadfeed",
+                build_files=["CMakeLists.txt"],
+            ),
+        ],
+    )
+
+    spec = stage._build_fallback_spec(knowledge=knowledge, context=context, project_name="demo")
+
+    assert spec.chosen_vulnerable_ref == "beadfeed"
+    assert spec.build_system == "cmake"
+    assert "cmake --build build -j$(nproc)" in spec.build_commands
+    assert "zlib1g-dev" in spec.install_packages
+    assert "libssl-dev" in spec.install_packages
+
+
 def test_build_node_records_retry_on_unsuccessful_build(monkeypatch):
     artifact = BuildArtifact(
         dockerfile_content="FROM ubuntu:20.04\n",
@@ -165,9 +193,10 @@ def test_normalize_build_plan_preserves_required_docker_packages(tmp_path):
     normalized = stage._normalize_build_plan(repo, plan)
 
     assert "git" in normalized.install_packages
+    assert "ca-certificates" in normalized.install_packages
 
 
-def test_normalize_build_plan_repairs_dockerfile_override_without_git(tmp_path):
+def test_normalize_build_plan_repairs_dockerfile_override_without_required_packages(tmp_path):
     stage = build_module.BuildStage()
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -186,4 +215,16 @@ def test_normalize_build_plan_repairs_dockerfile_override_without_git(tmp_path):
     normalized = stage._normalize_build_plan(repo, plan)
 
     assert "git" in normalized.install_packages
+    assert "ca-certificates" in normalized.install_packages
     assert "git" in normalized.dockerfile_override
+    assert "ca-certificates" in normalized.dockerfile_override
+
+
+def test_default_make_install_packages_include_ca_certificates():
+    stage = build_module.BuildStage()
+    knowledge = make_knowledge()
+
+    packages = stage._select_install_packages("make", knowledge)
+
+    assert "git" in packages
+    assert "ca-certificates" in packages

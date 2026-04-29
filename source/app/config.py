@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 
+load_dotenv()
+
+
 class AgentModelConfig(BaseModel):
     """Per-agent model configuration."""
 
@@ -58,7 +61,7 @@ def _load_agent_config(prefix: str, default_model: str = "gpt-4.1-mini") -> Agen
 def load_app_config() -> AppConfig:
     """Load environment variables from `.env` and build a config object."""
 
-    load_dotenv()
+    load_dotenv(override=True)
     return AppConfig(
         knowledge_agent=_load_agent_config("KNOWLEDGE_AGENT"),
         build_agent=_load_agent_config("BUILD_AGENT"),

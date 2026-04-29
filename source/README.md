@@ -9,15 +9,6 @@ cd DeepReproduction/source
 pdm install
 ```
 
-如果外网访问依赖本地代理，在运行需要联网的命令前显式添加：
-
-```bash
-HTTP_PROXY=http://127.0.0.1:7897 \
-HTTPS_PROXY=http://127.0.0.1:7897 \
-http_proxy=http://127.0.0.1:7897 \
-https_proxy=http://127.0.0.1:7897
-```
-
 ## 当前复现流程
 
 当前主流程是：
@@ -162,16 +153,6 @@ build 阶段当前会做：
 pdm run python scripts/run_knowledge.py CVE-2022-28805 --dataset-root ../Dataset
 ```
 
-如果外网访问依赖本地代理，使用：
-
-```bash
-HTTP_PROXY=http://127.0.0.1:7897 \
-HTTPS_PROXY=http://127.0.0.1:7897 \
-http_proxy=http://127.0.0.1:7897 \
-https_proxy=http://127.0.0.1:7897 \
-pdm run python scripts/run_knowledge.py CVE-2022-28805 --dataset-root ../Dataset
-```
-
 测试前如需清空旧产物，可删除对应 CVE 目录：
 
 ```bash
@@ -199,16 +180,6 @@ rm -rf ../Dataset/CVE-2022-28805
 当前 build 阶段的独立测试入口是：
 
 ```bash
-pdm run python scripts/run_build.py CVE-2022-28805 --dataset-root ../Dataset --workspace-root workspaces
-```
-
-如果需要通过本地代理联网 clone 目标仓库，使用：
-
-```bash
-HTTP_PROXY=http://127.0.0.1:7897 \
-HTTPS_PROXY=http://127.0.0.1:7897 \
-http_proxy=http://127.0.0.1:7897 \
-https_proxy=http://127.0.0.1:7897 \
 pdm run python scripts/run_build.py CVE-2022-28805 --dataset-root ../Dataset --workspace-root workspaces
 ```
 
