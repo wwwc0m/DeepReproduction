@@ -794,18 +794,57 @@ def run_knowledge_agent(cve_id: str, dataset_root: str = "Dataset") -> Knowledge
 
 
 def knowledge_node(state):
-    """Optional LangGraph adapter kept for compatibility."""
+    """LangGraph v1 节点：执行 knowledge 阶段。"""
 
     task = state["task"]
-    knowledge = run_knowledge_agent(cve_id=task.cve_id)
+    dataset_root = state.get("dataset_root", "Dataset")
     history = list(state.get("stage_history", []))
-    history.append({"stage": "knowledge", "status": "success"})
-    return {
-        "knowledge": knowledge,
-        "current_stage": "build",
-        "stage_history": history,
-        "last_error": None,
-    }
+    stage_status = dict(state.get("stage_status", {}))
+    artifacts = dict(state.get("artifacts", {}))
+    paths = build_knowledge_paths(task.cve_id, dataset_root=dataset_root)
+
+    try:
+        knowledge = run_knowledge_agent(cve_id=task.cve_id, dataset_root=dataset_root)
+        history.append({"stage": "knowledge", "status": "success"})
+        stage_status["knowledge"] = "success"
+        artifacts["knowledge"] = {
+            "task_yaml": str(paths.task_yaml),
+            "knowledge_yaml": str(paths.knowledge_yaml),
+            "runtime_state_yaml": str(paths.runtime_state_yaml),
+            "knowledge_sources_yaml": str(paths.knowledge_sources_yaml),
+            "patch_diff": str(paths.patch_diff),
+        }
+        return {
+            "knowledge": knowledge,
+            "current_stage": "build",
+            "review_stage": "",
+            "human_action_required": False,
+            "review_reason": "",
+            "stage_history": history,
+            "stage_status": stage_status,
+            "artifacts": artifacts,
+            "last_error": None,
+        }
+    except Exception as error:
+        history.append({"stage": "knowledge", "status": "failed", "error": str(error)})
+        stage_status["knowledge"] = "failed"
+        artifacts["knowledge"] = {
+            "task_yaml": str(paths.task_yaml),
+            "runtime_state_yaml": str(paths.runtime_state_yaml),
+            "knowledge_sources_yaml": str(paths.knowledge_sources_yaml),
+            "patch_diff": str(paths.patch_diff),
+        }
+        return {
+            "current_stage": "knowledge",
+            "review_stage": "knowledge",
+            "human_action_required": True,
+            "review_reason": "knowledge stage failed",
+            "stage_history": history,
+            "stage_status": stage_status,
+            "artifacts": artifacts,
+            "last_error": str(error),
+            "final_status": "needs_review",
+        }
 
 
 def prepare_layout(paths: KnowledgePaths) -> None:

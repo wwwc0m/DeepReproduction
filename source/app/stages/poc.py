@@ -1081,17 +1081,36 @@ def poc_node(state):
     workspace = state["workspace"]
     retry_count = dict(state.get("retry_count", {}))
     history = list(state.get("stage_history", []))
+    stage_status = dict(state.get("stage_status", {}))
+    artifacts = dict(state.get("artifacts", {}))
     stage = PocStage()
+    paths = PocStagePaths(workspace)
 
     try:
         poc = stage.run(knowledge=knowledge, build=build, workspace=workspace)
+        artifacts["poc"] = {
+            "poc_context_yaml": str(paths.poc_context_yaml),
+            "poc_plan_yaml": str(paths.poc_plan_yaml),
+            "dockerfile": str(paths.dockerfile),
+            "run_script": str(paths.run_script),
+            "poc_log": str(paths.poc_log),
+            "crash_report": str(paths.crash_report),
+            "poc_artifact_yaml": str(paths.poc_artifact_yaml),
+            "run_verify_yaml": str(paths.run_verify_yaml),
+        }
 
         if poc.execution_success and poc.reproducer_verified:
             history.append({"stage": "poc", "status": "success"})
+            stage_status["poc"] = "success"
             return {
                 "poc": poc,
                 "current_stage": "verify",
+                "review_stage": "",
+                "human_action_required": False,
+                "review_reason": "",
                 "stage_history": history,
+                "stage_status": stage_status,
+                "artifacts": artifacts,
                 "last_error": None,
             }
 
@@ -1102,27 +1121,50 @@ def poc_node(state):
                 "status": "executed_but_unverified",
                 "note": "PoC executed but no expected behavior observed; deferring to verify for independent judgment",
             })
+            stage_status["poc"] = "executed_but_unverified"
             return {
                 "poc": poc,
                 "current_stage": "verify",
+                "review_stage": "",
+                "human_action_required": False,
+                "review_reason": "",
                 "stage_history": history,
+                "stage_status": stage_status,
+                "artifacts": artifacts,
                 "last_error": None,
             }
 
         # execution_success=False
         retry_count["poc"] = retry_count.get("poc", 0) + 1
         history.append({"stage": "poc", "status": "failed", "error": poc.execution_logs})
+        stage_status["poc"] = "failed"
         return {
             "poc": poc,
+            "current_stage": "poc",
             "retry_count": retry_count,
+            "review_stage": "poc",
+            "review_reason": "poc stage completed without a successful execution",
             "stage_history": history,
+            "stage_status": stage_status,
+            "artifacts": artifacts,
             "last_error": "poc stage completed without a successful execution",
         }
     except Exception as error:
         retry_count["poc"] = retry_count.get("poc", 0) + 1
         history.append({"stage": "poc", "status": "failed", "error": str(error)})
+        stage_status["poc"] = "failed"
+        artifacts["poc"] = {
+            "poc_dir": str(paths.poc_dir),
+            "payloads_dir": str(paths.payloads_dir),
+            "inputs_dir": str(paths.inputs_dir),
+        }
         return {
+            "current_stage": "poc",
             "retry_count": retry_count,
+            "review_stage": "poc",
+            "review_reason": "poc stage raised an exception",
             "stage_history": history,
+            "stage_status": stage_status,
+            "artifacts": artifacts,
             "last_error": str(error),
         }

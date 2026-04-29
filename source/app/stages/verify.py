@@ -822,10 +822,20 @@ def verify_node(state):
     build = state["build"]
     poc = state["poc"]
     workspace = state["workspace"]
+    dataset_root = state.get("dataset_root")
+    artifacts = dict(state.get("artifacts", {}))
+    stage_status = dict(state.get("stage_status", {}))
     stage = VerifyStage()
+    paths = VerifyStagePaths(workspace)
 
     try:
-        verify = stage.run(knowledge=knowledge, build=build, poc=poc, workspace=workspace)
+        verify = stage.run(
+            knowledge=knowledge,
+            build=build,
+            poc=poc,
+            workspace=workspace,
+            dataset_root=dataset_root,
+        )
     except Exception as error:
         verify = VerifyResult(
             pre_patch_triggered=False,
@@ -837,6 +847,17 @@ def verify_node(state):
 
     history = list(state.get("stage_history", []))
     history.append({"stage": "verify", "status": verify.verdict})
+    stage_status["verify"] = verify.verdict
+    artifacts["verify"] = {
+        "verify_dir": str(paths.verify_dir),
+        "verify_context_yaml": str(paths.verify_context_yaml),
+        "verify_plan_yaml": str(paths.verify_plan_yaml),
+        "verify_run_script": str(paths.verify_run_script),
+        "patch_diff": str(paths.patch_diff_copy),
+        "pre_patch_log": str(paths.pre_patch_log),
+        "post_patch_log": str(paths.post_patch_log),
+        "verify_result_yaml": str(paths.verify_result_yaml),
+    }
 
     if verify.verdict == "success":
         final_status = "success"
@@ -847,7 +868,13 @@ def verify_node(state):
 
     return {
         "verify": verify,
+        "current_stage": "verify",
+        "review_stage": "verify" if final_status != "success" else "",
+        "human_action_required": final_status != "success",
+        "review_reason": verify.reason if final_status != "success" else "",
         "final_status": final_status,
         "stage_history": history,
+        "stage_status": stage_status,
+        "artifacts": artifacts,
         "last_error": None if final_status == "success" else verify.reason,
     }

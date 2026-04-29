@@ -1169,33 +1169,70 @@ def build_node(state):
     workspace = state["workspace"]
     retry_count = dict(state.get("retry_count", {}))
     history = list(state.get("stage_history", []))
+    stage_status = dict(state.get("stage_status", {}))
+    artifacts = dict(state.get("artifacts", {}))
     stage = BuildStage()
+    paths = BuildStagePaths(workspace)
 
     try:
         build = stage.run(knowledge=knowledge, workspace=workspace)
+        artifacts["build"] = {
+            "workspace": str(paths.workspace_root),
+            "repo_dir": str(paths.repo_dir),
+            "build_context_yaml": str(paths.build_context_yaml),
+            "build_plan_yaml": str(paths.build_plan_yaml),
+            "dockerfile": str(paths.dockerfile),
+            "build_script": str(paths.build_script),
+            "build_log": str(paths.build_log),
+            "build_artifact_yaml": str(paths.build_artifact_yaml),
+            "build_verify_yaml": str(paths.build_verify_yaml),
+        }
         if build.build_success:
             history.append({"stage": "build", "status": "success"})
+            stage_status["build"] = "success"
             return {
                 "build": build,
                 "current_stage": "poc",
+                "review_stage": "",
+                "human_action_required": False,
+                "review_reason": "",
                 "stage_history": history,
+                "stage_status": stage_status,
+                "artifacts": artifacts,
                 "last_error": None,
             }
 
         retry_count["build"] = retry_count.get("build", 0) + 1
         history.append({"stage": "build", "status": "failed", "error": build.build_logs})
+        stage_status["build"] = "failed"
         return {
             "build": build,
+            "current_stage": "build",
             "retry_count": retry_count,
+            "review_stage": "build",
+            "review_reason": "build stage completed without a successful build",
             "stage_history": history,
+            "stage_status": stage_status,
+            "artifacts": artifacts,
             "last_error": "build stage completed without a successful build",
         }
     except Exception as error:
         retry_count["build"] = retry_count.get("build", 0) + 1
         history.append({"stage": "build", "status": "failed", "error": str(error)})
+        stage_status["build"] = "failed"
+        artifacts["build"] = {
+            "workspace": str(paths.workspace_root),
+            "repo_dir": str(paths.repo_dir),
+            "build_dir": str(paths.build_dir),
+        }
         return {
+            "current_stage": "build",
             "retry_count": retry_count,
+            "review_stage": "build",
+            "review_reason": "build stage raised an exception",
             "stage_history": history,
+            "stage_status": stage_status,
+            "artifacts": artifacts,
             "last_error": str(error),
         }
 
