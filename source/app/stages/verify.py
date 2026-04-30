@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 import yaml
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 try:
@@ -117,6 +118,54 @@ class VerifyPlan(BaseModel):
     post_log_path: str
 
 
+class VerifyPreparedRun(BaseModel):
+    """Deterministic inputs assembled before verify planning starts."""
+
+    context: VerifyContext
+
+
+class VerifyExecutionOutcome(BaseModel):
+    """One concrete verify execution outcome."""
+
+    plan: VerifyPlan
+    execute_result: dict[str, Any]
+
+
+class VerifyGraphState(TypedDict, total=False):
+    """Internal LangGraph state for the verify stage."""
+
+    knowledge: KnowledgeModel
+    build: BuildArtifact
+    poc: PoCArtifact
+    paths: VerifyStagePaths
+    dataset_root: Optional[str]
+    prepared: VerifyPreparedRun
+    plan: VerifyPlan
+    outcome: VerifyExecutionOutcome
+
+
+class VerifyPlanner:
+    """Encapsulates verify-stage planning decisions."""
+
+    def __init__(self, stage: "VerifyStage") -> None:
+        self.stage = stage
+
+    def plan(self, context: VerifyContext, paths: VerifyStagePaths) -> VerifyPlan:
+        return VerifyPlan(
+            image_tag=context.docker_image_tag,
+            pre_run_command=context.trigger_command,
+            post_run_command=context.trigger_command,
+            environment_variables=dict(context.environment_variables),
+            expected_stdout_patterns=list(context.expected_stdout_patterns),
+            expected_stderr_patterns=list(context.expected_stderr_patterns),
+            expected_stack_keywords=list(context.expected_stack_keywords),
+            expected_exit_code=context.expected_exit_code,
+            expected_crash_type=context.expected_crash_type,
+            pre_log_path=str(paths.pre_patch_log),
+            post_log_path=str(paths.post_patch_log),
+        )
+
+
 class VerifyStage:
     """Vulnerability verification orchestrator."""
 
@@ -129,6 +178,7 @@ class VerifyStage:
         self.process_tool = process_tool or ProcessTool()
         self.docker_tool = docker_tool or DockerTool(process_tool=self.process_tool)
         self.file_tool = file_tool or FileTool()
+        self.planner = VerifyPlanner(self)
 
     # ----- 公共入口 -----
     def run(
@@ -143,36 +193,104 @@ class VerifyStage:
         self.file_tool.ensure_dir(str(paths.verify_dir))
 
         try:
-            context = self.collect_verify_context(
+            prepared = self.prepare_verify_run(
                 knowledge, build, poc, paths, dataset_root=dataset_root
             )
         except Exception as error:
             return self._stage_exception("collect_verify_context", error, paths)
 
-        self.file_tool.safe_persist(
-            str(paths.verify_context_yaml),
-            yaml.safe_dump(context.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-            description="verify_context.yaml",
-        )
-
-        short_circuit = self._short_circuit_if_ineligible(context, paths)
+        short_circuit = self._short_circuit_if_ineligible(prepared.context, paths)
         if short_circuit is not None:
-            self.file_tool.safe_persist(
-                str(paths.verify_result_yaml),
-                yaml.safe_dump(short_circuit.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-                description="verify_result.yaml (short-circuit)",
-            )
+            self.persist_verify_result(short_circuit, paths, "verify_result.yaml (short-circuit)")
             return short_circuit
+
+        try:
+            subgraph = self.build_internal_graph()
+            result = subgraph.invoke(
+                {
+                    "paths": paths,
+                    "prepared": prepared,
+                }
+            )
+            outcome = result["outcome"]
+        except Exception as error:
+            where = "execute_verify" if "execute_verify" in str(error) else "plan_verify"
+            return self._stage_exception(where, error, paths)
+
+        try:
+            result = self.decide_verify_result(outcome, prepared.context)
+        except Exception as error:
+            return self._stage_exception("decide_verdict", error, paths)
+
+        self.persist_verify_result(result, paths, "verify_result.yaml")
+        return result
+
+    def build_internal_graph(self):
+        """Build the internal LangGraph subgraph for the verify stage."""
+
+        builder = StateGraph(VerifyGraphState)
+        builder.add_node("plan", self._verify_graph_plan_node)
+        builder.add_node("execute", self._verify_graph_execute_node)
+        builder.add_edge(START, "plan")
+        builder.add_edge("plan", "execute")
+        builder.add_edge("execute", END)
+        return builder.compile()
+
+    def _verify_graph_plan_node(self, state: VerifyGraphState) -> VerifyGraphState:
+        plan = self.plan_verify(state["prepared"].context, state["paths"])
+        self._safe_persist_yaml(
+            state["paths"].verify_plan_yaml,
+            plan.model_dump(mode="json"),
+            "verify_plan.yaml",
+        )
+        return {"plan": plan}
+
+    def _verify_graph_execute_node(self, state: VerifyGraphState) -> VerifyGraphState:
+        context = state["prepared"].context
+        plan = state["plan"]
+        paths = state["paths"]
+        self._render_dockerfile(context, paths)
+        self._render_verify_run_script(context, plan, paths)
+        self._copy_patch_diff(context, paths)
+        execute_result = self._execute_verify(context, plan, paths)
+        return {"outcome": VerifyExecutionOutcome(plan=plan, execute_result=execute_result)}
+
+    def prepare_verify_run(
+        self,
+        knowledge: KnowledgeModel,
+        build: BuildArtifact,
+        poc: PoCArtifact,
+        paths: VerifyStagePaths,
+        dataset_root: Optional[str] = None,
+    ) -> VerifyPreparedRun:
+        """Collect deterministic verify inputs before any planning starts."""
+
+        context = self.collect_verify_context(
+            knowledge, build, poc, paths, dataset_root=dataset_root
+        )
+        self._safe_persist_yaml(
+            paths.verify_context_yaml,
+            context.model_dump(mode="json"),
+            "verify_context.yaml",
+        )
+        return VerifyPreparedRun(context=context)
+
+    def plan_and_execute_verify(
+        self,
+        context: VerifyContext,
+        paths: VerifyStagePaths,
+    ) -> VerifyExecutionOutcome:
+        """Build the verify plan, render artifacts, and execute both passes."""
 
         try:
             plan = self.plan_verify(context, paths)
         except Exception as error:
-            return self._stage_exception("plan_verify", error, paths)
+            raise RuntimeError(f"plan_verify: {error}") from error
 
-        self.file_tool.safe_persist(
-            str(paths.verify_plan_yaml),
-            yaml.safe_dump(plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-            description="verify_plan.yaml",
+        self._safe_persist_yaml(
+            paths.verify_plan_yaml,
+            plan.model_dump(mode="json"),
+            "verify_plan.yaml",
         )
 
         try:
@@ -180,24 +298,32 @@ class VerifyStage:
             self._render_verify_run_script(context, plan, paths)
             self._copy_patch_diff(context, paths)
         except Exception as error:
-            return self._stage_exception("render_or_copy", error, paths)
+            raise RuntimeError(f"render_or_copy: {error}") from error
 
         try:
             execute_result = self._execute_verify(context, plan, paths)
         except Exception as error:
-            return self._stage_exception("execute_verify", error, paths)
+            raise RuntimeError(f"execute_verify: {error}") from error
 
-        try:
-            result = self._decide_verdict(execute_result, context)
-        except Exception as error:
-            return self._stage_exception("decide_verdict", error, paths)
+        return VerifyExecutionOutcome(plan=plan, execute_result=execute_result)
 
-        self.file_tool.safe_persist(
-            str(paths.verify_result_yaml),
-            yaml.safe_dump(result.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-            description="verify_result.yaml",
+    def decide_verify_result(
+        self,
+        outcome: VerifyExecutionOutcome,
+        context: VerifyContext,
+    ) -> VerifyResult:
+        """Decide the final verify result from execution outcomes."""
+
+        return self._decide_verdict(outcome.execute_result, context)
+
+    def persist_verify_result(self, result: VerifyResult, paths: VerifyStagePaths, description: str) -> None:
+        """Persist the final verify result."""
+
+        self._safe_persist_yaml(
+            paths.verify_result_yaml,
+            result.model_dump(mode="json"),
+            description,
         )
-        return result
 
     # ----- 五层结构 -----
     def collect_verify_context(
@@ -267,23 +393,7 @@ class VerifyStage:
     def plan_verify(self, context: VerifyContext, paths: VerifyStagePaths) -> VerifyPlan:
         """Build a deterministic pre/post execution plan."""
 
-        # TODO(verify-agent-llm): future LLM-based replanner stub
-        # planner = build_chat_model("verify_agent")
-        # 当前阶段使用确定性规则，不接 LLM。
-
-        return VerifyPlan(
-            image_tag=context.docker_image_tag,
-            pre_run_command=context.trigger_command,
-            post_run_command=context.trigger_command,
-            environment_variables=dict(context.environment_variables),
-            expected_stdout_patterns=list(context.expected_stdout_patterns),
-            expected_stderr_patterns=list(context.expected_stderr_patterns),
-            expected_stack_keywords=list(context.expected_stack_keywords),
-            expected_exit_code=context.expected_exit_code,
-            expected_crash_type=context.expected_crash_type,
-            pre_log_path=str(paths.pre_patch_log),
-            post_log_path=str(paths.post_patch_log),
-        )
+        return self.planner.plan(context, paths)
 
     def _execute_verify(
         self,
@@ -496,6 +606,15 @@ class VerifyStage:
             docker_result.stderr,
         ]
         return "\n".join(parts)
+
+    def _safe_persist_yaml(self, path: Path, payload: dict[str, Any], description: str) -> None:
+        """Persist YAML using one consistent formatting policy."""
+
+        self.file_tool.safe_persist(
+            str(path),
+            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+            description=description,
+        )
 
     def _parse_patch_apply_exit_code(self, log: str) -> Optional[int]:
         match = re.search(r"^patch_apply_exit_code=(-?\d+)$", log, re.MULTILINE)

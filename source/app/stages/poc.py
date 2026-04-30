@@ -13,10 +13,11 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 try:
@@ -179,6 +180,145 @@ class RunVerifyReport(BaseModel):
     )
 
 
+class PocPreparedRun(BaseModel):
+    """Deterministic inputs assembled before PoC planning starts."""
+
+    plan_meta: dict[str, Any]
+    context: PocContext
+
+
+class PocExecutionOutcome(BaseModel):
+    """One concrete PoC execution attempt."""
+
+    plan: PocPlan
+    artifact: PoCArtifact
+
+
+class PocGraphState(TypedDict, total=False):
+    """Internal LangGraph state for the PoC stage."""
+
+    knowledge: KnowledgeModel
+    build: BuildArtifact
+    paths: PocStagePaths
+    prepared: PocPreparedRun
+    current_context: PocContext
+    current_plan: PocPlan
+    outcome: PocExecutionOutcome
+    attempt: int
+
+
+class PocFallbackSpec(BaseModel):
+    """Deterministic fallback planning spec for the PoC stage."""
+
+    trigger_mode: str = "cli-file"
+    target_binary: str = ""
+    target_args: list[str] = Field(default_factory=list)
+    payload_filename: str = "poc.txt"
+    payload_content: str = ""
+    run_command: str = ""
+    expected_stdout_patterns: list[str] = Field(default_factory=list)
+    expected_stderr_patterns: list[str] = Field(default_factory=list)
+    expected_stack_keywords: list[str] = Field(default_factory=list)
+    expected_crash_type: str = ""
+    source_of_truth: str = "heuristic"
+    confidence: str = "medium"
+    rationale: str = ""
+
+
+class PocPlanner:
+    """Encapsulates PoC-stage planning decisions."""
+
+    def __init__(self, stage: "PocStage") -> None:
+        self.stage = stage
+
+    def plan(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
+        llm_plan = self.try_llm_plan(knowledge=knowledge, build=build, context=context)
+        if llm_plan is not None:
+            return self.stage._normalize_poc_plan(llm_plan)
+        return self.stage._normalize_poc_plan(
+            self.heuristic_plan(knowledge=knowledge, build=build, context=context)
+        )
+
+    def replan_after_failure(
+        self,
+        knowledge: KnowledgeModel,
+        build: BuildArtifact,
+        context: PocContext,
+        previous_plan: PocPlan,
+        previous_artifact: PoCArtifact,
+    ) -> Optional[PocPlan]:
+        retry_context = context.model_copy(
+            update={
+                "planner_attempt": context.planner_attempt + 1,
+                "previous_failure_kind": self.stage._classify_failure_kind(previous_artifact.execution_logs),
+                "previous_execution_log": previous_artifact.execution_logs[:6000],
+            }
+        )
+        return self.try_llm_plan(
+            knowledge=knowledge,
+            build=build,
+            context=retry_context,
+            previous_plan=previous_plan,
+            previous_artifact=previous_artifact,
+        )
+
+    def heuristic_plan(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
+        spec = self.stage._build_fallback_spec(knowledge=knowledge, build=build, context=context)
+        return PocPlan(
+            trigger_mode=spec.trigger_mode,
+            target_binary=spec.target_binary,
+            target_args=spec.target_args,
+            payload_filename=spec.payload_filename,
+            payload_content=spec.payload_content,
+            run_command=spec.run_command,
+            expected_exit_code=None,
+            expected_stdout_patterns=spec.expected_stdout_patterns,
+            expected_stderr_patterns=spec.expected_stderr_patterns,
+            expected_stack_keywords=spec.expected_stack_keywords,
+            expected_crash_type=spec.expected_crash_type,
+            source_of_truth=spec.source_of_truth,
+            confidence=spec.confidence,
+            rationale=spec.rationale,
+        )
+
+    def try_llm_plan(
+        self,
+        knowledge: KnowledgeModel,
+        build: BuildArtifact,
+        context: PocContext,
+        previous_plan: Optional[PocPlan] = None,
+        previous_artifact: Optional[PoCArtifact] = None,
+    ) -> Optional[PocPlan]:
+        try:
+            model = build_chat_model("poc_agent", temperature=0)
+        except Exception:
+            return None
+
+        prompt = self.stage._build_llm_prompt(
+            knowledge=knowledge,
+            build=build,
+            context=context,
+            previous_plan=previous_plan,
+            previous_artifact=previous_artifact,
+        )
+        try:
+            response = model.invoke(
+                [
+                    SystemMessage(content="You return strict JSON only."),
+                    HumanMessage(content=prompt),
+                ]
+            )
+            parsed = parse_llm_json_payload(getattr(response, "content", response))
+            if parsed is None:
+                return None
+            plan = PocPlan(**parsed)
+            if not plan.target_binary and not plan.run_command:
+                return None
+            return plan
+        except Exception:
+            return None
+
+
 class PocStage:
     """PoC 阶段协调器。"""
 
@@ -187,6 +327,7 @@ class PocStage:
     def __init__(self, file_tool: FileTool | None = None, docker_tool: DockerTool | None = None) -> None:
         self.file_tool = file_tool or FileTool()
         self.docker_tool = docker_tool or DockerTool()
+        self.planner = PocPlanner(self)
 
     def build_plan(self, knowledge: KnowledgeModel, build: BuildArtifact, workspace: str) -> dict:
         """生成 PoC 阶段静态元数据。"""
@@ -270,12 +411,9 @@ class PocStage:
         )
 
     def plan_poc(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
-        """Generate the structured PoC plan."""
+        """Generate the structured PoC plan using the dedicated planner."""
 
-        llm_plan = self._try_llm_poc_plan(knowledge=knowledge, build=build, context=context)
-        if llm_plan is not None:
-            return self._normalize_poc_plan(llm_plan)
-        return self._normalize_poc_plan(self._heuristic_poc_plan(knowledge=knowledge, build=build, context=context))
+        return self.planner.plan(knowledge=knowledge, build=build, context=context)
 
     def replan_after_failure(
         self,
@@ -285,19 +423,12 @@ class PocStage:
         previous_plan: PocPlan,
         previous_artifact: PoCArtifact,
     ) -> Optional[PocPlan]:
-        """Ask the model to adjust the PoC plan after one failed execution."""
+        """Ask the planner to adjust the PoC plan after one failed execution."""
 
-        retry_context = context.model_copy(
-            update={
-                "planner_attempt": context.planner_attempt + 1,
-                "previous_failure_kind": self._classify_failure_kind(previous_artifact.execution_logs),
-                "previous_execution_log": previous_artifact.execution_logs[:6000],
-            }
-        )
-        return self._try_llm_poc_plan(
+        return self.planner.replan_after_failure(
             knowledge=knowledge,
             build=build,
-            context=retry_context,
+            context=context,
             previous_plan=previous_plan,
             previous_artifact=previous_artifact,
         )
@@ -308,37 +439,50 @@ class PocStage:
         self.file_tool.ensure_dir(str(paths.payloads_dir))
         self.file_tool.ensure_dir(str(paths.inputs_dir))
 
+    def _write_yaml_file(self, path: Path, payload: Any) -> None:
+        """Persist YAML using one consistent formatting policy."""
+
+        self.file_tool.write_text(
+            str(path),
+            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        )
+
     def _heuristic_poc_plan(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
+        return self.planner.heuristic_plan(knowledge=knowledge, build=build, context=context)
+
+    def _build_fallback_spec(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocFallbackSpec:
+        """Assemble all heuristic PoC decisions in one place."""
+
         reference_poc = self._load_reference_poc(knowledge.cve_id)
         payload_filename = "poc.txt"
         payload_content = "trigger\n"
         source_of_truth = "heuristic"
         rationale = "Fallback PoC generated from knowledge hints and build artifact."
+        confidence = "medium"
 
         if reference_poc is not None:
             payload_filename = reference_poc[0]
             payload_content = reference_poc[1]
             source_of_truth = "dataset_poc"
             rationale = "Adopted the dataset-provided PoC as the primary payload."
+            confidence = "high"
 
         target_binary = self._select_target_binary(build, context, payload_filename)
         target_args = self._select_target_args(knowledge, payload_filename, context, target_binary)
-        run_command = self._build_run_command(target_binary, target_args)
 
-        return PocPlan(
+        return PocFallbackSpec(
             trigger_mode=self._infer_trigger_mode(payload_filename, context),
             target_binary=target_binary,
             target_args=target_args,
             payload_filename=payload_filename,
             payload_content=payload_content,
-            run_command=run_command,
-            expected_exit_code=None,
+            run_command=self._build_run_command(target_binary, target_args),
             expected_stdout_patterns=[],
             expected_stderr_patterns=list(knowledge.expected_error_patterns),
             expected_stack_keywords=list(knowledge.expected_stack_keywords),
             expected_crash_type=self._infer_expected_crash_type(knowledge),
             source_of_truth=source_of_truth,
-            confidence="medium" if reference_poc is None else "high",
+            confidence=confidence,
             rationale=rationale,
         )
 
@@ -350,34 +494,13 @@ class PocStage:
         previous_plan: Optional[PocPlan] = None,
         previous_artifact: Optional[PoCArtifact] = None,
     ) -> Optional[PocPlan]:
-        try:
-            model = build_chat_model("poc_agent", temperature=0)
-        except Exception:
-            return None
-
-        prompt = self._build_llm_prompt(
+        return self.planner.try_llm_plan(
             knowledge=knowledge,
             build=build,
             context=context,
             previous_plan=previous_plan,
             previous_artifact=previous_artifact,
         )
-        try:
-            response = model.invoke(
-                [
-                    SystemMessage(content="You return strict JSON only."),
-                    HumanMessage(content=prompt),
-                ]
-            )
-            parsed = parse_llm_json_payload(getattr(response, "content", response))
-            if parsed is None:
-                return None
-            plan = PocPlan(**parsed)
-            if not plan.target_binary and not plan.run_command:
-                return None
-            return plan
-        except Exception:
-            return None
 
     def _build_llm_prompt(
         self,
@@ -611,58 +734,181 @@ class PocStage:
     def run(self, knowledge: KnowledgeModel, build: BuildArtifact, workspace: str) -> PoCArtifact:
         """执行 PoC 阶段并返回 PoC 产物。"""
 
-        plan_meta = self.build_plan(knowledge=knowledge, build=build, workspace=workspace)
         paths = PocStagePaths(workspace)
-        self._prepare_workspace(paths)
-
-        current_context = self.collect_poc_context(knowledge=knowledge, build=build, workspace=workspace, planner_attempt=1)
-        self.file_tool.write_text(
-            str(paths.poc_context_yaml),
-            yaml.safe_dump(current_context.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
+        subgraph = self.build_internal_graph()
+        result = subgraph.invoke(
+            {
+                "knowledge": knowledge,
+                "build": build,
+                "paths": paths,
+                "attempt": 0,
+            }
         )
+        outcome = result["outcome"]
+        self.persist_poc_outputs(outcome.artifact, paths)
+        return outcome.artifact
 
-        artifact: PoCArtifact | None = None
+    def build_internal_graph(self):
+        """Build the internal LangGraph subgraph for the PoC stage."""
+
+        builder = StateGraph(PocGraphState)
+        builder.add_node("prepare", self._poc_graph_prepare_node)
+        builder.add_node("plan", self._poc_graph_plan_node)
+        builder.add_node("execute", self._poc_graph_execute_node)
+        builder.add_edge(START, "prepare")
+        builder.add_edge("prepare", "plan")
+        builder.add_edge("plan", "execute")
+        builder.add_conditional_edges(
+            "execute",
+            self._route_after_poc_execute,
+            {
+                "plan": "plan",
+                "done": END,
+            },
+        )
+        return builder.compile()
+
+    def _poc_graph_prepare_node(self, state: PocGraphState) -> PocGraphState:
+        prepared = self.prepare_poc_run(
+            knowledge=state["knowledge"],
+            build=state["build"],
+            paths=state["paths"],
+        )
+        return {
+            "prepared": prepared,
+            "current_context": prepared.context,
+            "attempt": 0,
+        }
+
+    def _poc_graph_plan_node(self, state: PocGraphState) -> PocGraphState:
+        plan = self.plan_poc(
+            knowledge=state["knowledge"],
+            build=state["build"],
+            context=state["current_context"],
+        )
+        return {"current_plan": plan}
+
+    def _poc_graph_execute_node(self, state: PocGraphState) -> PocGraphState:
+        prepared = state["prepared"]
+        paths = state["paths"]
+        plan = state["current_plan"]
+        self._write_yaml_file(paths.poc_plan_yaml, plan.model_dump(mode="json"))
+        outcome = self.execute_poc_attempt(paths, prepared.plan_meta, plan)
+        updates: PocGraphState = {
+            "outcome": outcome,
+            "attempt": state.get("attempt", 0) + 1,
+            "current_plan": plan,
+        }
+        if not (outcome.artifact.execution_success and outcome.artifact.reproducer_verified):
+            current_context = state["current_context"].model_copy(
+                update={
+                    "planner_attempt": state["current_context"].planner_attempt + 1,
+                    "previous_failure_kind": self._classify_failure_kind(outcome.artifact.execution_logs),
+                    "previous_execution_log": outcome.artifact.execution_logs[:6000],
+                }
+            )
+            updates["current_context"] = current_context
+            replanned = self.replan_after_failure(
+                knowledge=state["knowledge"],
+                build=state["build"],
+                context=state["current_context"],
+                previous_plan=plan,
+                previous_artifact=outcome.artifact,
+            )
+            if replanned is not None:
+                updates["current_plan"] = self._normalize_poc_plan(replanned)
+        return updates
+
+    def _route_after_poc_execute(self, state: PocGraphState) -> str:
+        outcome = state.get("outcome")
+        attempt = state.get("attempt", 0)
+        if outcome is None:
+            return "done"
+        if outcome.artifact.execution_success and outcome.artifact.reproducer_verified:
+            return "done"
+        if attempt >= self.MAX_REPLAN_ATTEMPTS:
+            return "done"
+        return "plan"
+
+    def prepare_poc_run(
+        self,
+        knowledge: KnowledgeModel,
+        build: BuildArtifact,
+        paths: PocStagePaths,
+    ) -> PocPreparedRun:
+        """Collect deterministic PoC inputs before any planning starts."""
+
+        plan_meta = self.build_plan(knowledge=knowledge, build=build, workspace=str(paths.workspace_root))
+        self._prepare_workspace(paths)
+        context = self.collect_poc_context(
+            knowledge=knowledge,
+            build=build,
+            workspace=str(paths.workspace_root),
+            planner_attempt=1,
+        )
+        self._write_yaml_file(paths.poc_context_yaml, context.model_dump(mode="json"))
+        return PocPreparedRun(plan_meta=plan_meta, context=context)
+
+    def plan_and_execute_poc(
+        self,
+        knowledge: KnowledgeModel,
+        build: BuildArtifact,
+        prepared: PocPreparedRun,
+        paths: PocStagePaths,
+    ) -> PocExecutionOutcome:
+        """Generate a PoC plan, execute it, and optionally replan after failures."""
+
+        current_context = prepared.context
+        last_outcome: PocExecutionOutcome | None = None
+
         for attempt in range(self.MAX_REPLAN_ATTEMPTS):
             plan = self.plan_poc(knowledge=knowledge, build=build, context=current_context)
-            self.file_tool.write_text(
-                str(paths.poc_plan_yaml),
-                yaml.safe_dump(plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-            )
-            artifact = self._execute_poc_plan(paths=paths, plan_meta=plan_meta, plan=plan)
-            if (artifact.execution_success and artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
+            self._write_yaml_file(paths.poc_plan_yaml, plan.model_dump(mode="json"))
+            last_outcome = self.execute_poc_attempt(paths, prepared.plan_meta, plan)
+            if (last_outcome.artifact.execution_success and last_outcome.artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
                 break
+
             replanned = self.replan_after_failure(
                 knowledge=knowledge,
                 build=build,
                 context=current_context,
                 previous_plan=plan,
-                previous_artifact=artifact,
+                previous_artifact=last_outcome.artifact,
             )
             if replanned is not None:
                 replanned = self._normalize_poc_plan(replanned)
-                self.file_tool.write_text(
-                    str(paths.poc_plan_yaml),
-                    yaml.safe_dump(replanned.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-                )
-                artifact = self._execute_poc_plan(paths=paths, plan_meta=plan_meta, plan=replanned)
-                if (artifact.execution_success and artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
+                self._write_yaml_file(paths.poc_plan_yaml, replanned.model_dump(mode="json"))
+                last_outcome = self.execute_poc_attempt(paths, prepared.plan_meta, replanned)
+                if (last_outcome.artifact.execution_success and last_outcome.artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
                     break
+
             current_context = current_context.model_copy(
                 update={
                     "planner_attempt": current_context.planner_attempt + 1,
-                    "previous_failure_kind": self._classify_failure_kind(artifact.execution_logs),
-                    "previous_execution_log": artifact.execution_logs[:6000],
+                    "previous_failure_kind": self._classify_failure_kind(last_outcome.artifact.execution_logs),
+                    "previous_execution_log": last_outcome.artifact.execution_logs[:6000],
                 }
             )
 
-        if artifact is None:
+        if last_outcome is None:
             raise RuntimeError("poc stage did not produce an artifact")
+        return last_outcome
 
-        self.file_tool.write_text(
-            str(paths.poc_artifact_yaml),
-            yaml.safe_dump(artifact.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-        )
-        return artifact
+    def execute_poc_attempt(
+        self,
+        paths: PocStagePaths,
+        plan_meta: dict[str, Any],
+        plan: PocPlan,
+    ) -> PocExecutionOutcome:
+        """Execute one concrete PoC attempt from a single plan."""
+
+        artifact = self._execute_poc_plan(paths=paths, plan_meta=plan_meta, plan=plan)
+        return PocExecutionOutcome(plan=plan, artifact=artifact)
+
+    def persist_poc_outputs(self, artifact: PoCArtifact, paths: PocStagePaths) -> None:
+        """Persist the final PoC artifact."""
+
+        self._write_yaml_file(paths.poc_artifact_yaml, artifact.model_dump(mode="json"))
 
     def _read_patch_diff(self, cve_id: str) -> str:
         path = find_patch_diff(cve_id)

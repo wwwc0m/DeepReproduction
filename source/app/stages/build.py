@@ -11,10 +11,11 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 try:
@@ -101,6 +102,157 @@ class BuildContext(BaseModel):
     previous_build_failure: str = Field(default="", description="Previous build failure logs for replanning.")
 
 
+class BuildPreparedRun(BaseModel):
+    """Deterministic inputs assembled before planning starts."""
+
+    plan_meta: dict[str, Any]
+    repo_path: str
+    context: BuildContext
+
+
+class BuildExecutionOutcome(BaseModel):
+    """One concrete build attempt outcome."""
+
+    plan: BuildPlan
+    artifact: BuildArtifact
+
+
+class BuildGraphState(TypedDict, total=False):
+    """Internal LangGraph state for the build stage."""
+
+    knowledge: KnowledgeModel
+    paths: BuildStagePaths
+    prepared: BuildPreparedRun
+    current_context: BuildContext
+    current_plan: BuildPlan
+    outcome: BuildExecutionOutcome
+    attempt: int
+    should_retry: bool
+
+
+class BuildFallbackSpec(BaseModel):
+    """Deterministic fallback planning spec used when LLM planning is unavailable."""
+
+    chosen_vulnerable_ref: str
+    chosen_fixed_ref: Optional[str] = None
+    build_system: str = "unknown"
+    install_packages: list[str] = Field(default_factory=list)
+    configure_commands: list[str] = Field(default_factory=list)
+    clean_commands: list[str] = Field(default_factory=list)
+    build_commands: list[str] = Field(default_factory=list)
+    expected_binary_path: Optional[str] = None
+    source_of_truth: str = "heuristic"
+    confidence: str = "medium"
+    rationale: str = ""
+
+
+class BuildPlanner:
+    """Encapsulates build-stage planning decisions."""
+
+    def __init__(self, stage: "BuildStage") -> None:
+        self.stage = stage
+
+    def plan(self, knowledge: KnowledgeModel, context: BuildContext, project_name: str) -> BuildPlan:
+        llm_plan = self.try_llm_plan(knowledge=knowledge, context=context, project_name=project_name)
+        if llm_plan is not None:
+            return llm_plan
+        return self.heuristic_plan(knowledge=knowledge, context=context, project_name=project_name)
+
+    def replan_after_failure(
+        self,
+        knowledge: KnowledgeModel,
+        context: BuildContext,
+        project_name: str,
+        previous_plan: BuildPlan,
+        build_logs: str,
+        failure_kind: str,
+    ) -> Optional[BuildPlan]:
+        retry_context = context.model_copy(
+            update={
+                "planner_attempt": context.planner_attempt + 1,
+                "previous_failure_kind": failure_kind,
+                "previous_build_failure": build_logs[:6000],
+            }
+        )
+        return self.try_llm_plan(
+            knowledge=knowledge,
+            context=retry_context,
+            project_name=project_name,
+            previous_plan=previous_plan,
+        )
+
+    def try_llm_plan(
+        self,
+        knowledge: KnowledgeModel,
+        context: BuildContext,
+        project_name: str,
+        previous_plan: Optional[BuildPlan] = None,
+    ) -> Optional[BuildPlan]:
+        try:
+            model = build_chat_model("build_agent", temperature=0)
+        except Exception:
+            return None
+
+        prompt = self.build_llm_prompt(
+            knowledge=knowledge,
+            context=context,
+            project_name=project_name,
+            previous_plan=previous_plan,
+        )
+        try:
+            response = model.invoke(
+                [
+                    SystemMessage(content="You return strict JSON only."),
+                    HumanMessage(content=prompt),
+                ]
+            )
+            parsed = parse_llm_json_payload(getattr(response, "content", response))
+            if parsed is None:
+                return None
+            plan = BuildPlan(**parsed)
+            if not plan.build_commands:
+                return None
+            return plan
+        except Exception:
+            return None
+
+    def build_llm_prompt(
+        self,
+        knowledge: KnowledgeModel,
+        context: BuildContext,
+        project_name: str,
+        previous_plan: Optional[BuildPlan],
+    ) -> str:
+        return self.stage._build_llm_prompt(
+            knowledge=knowledge,
+            context=context,
+            project_name=project_name,
+            previous_plan=previous_plan,
+        )
+
+    def heuristic_plan(self, knowledge: KnowledgeModel, context: BuildContext, project_name: str) -> BuildPlan:
+        fallback_spec = self.stage._build_fallback_spec(
+            knowledge=knowledge,
+            context=context,
+            project_name=project_name,
+        )
+        return BuildPlan(
+            chosen_vulnerable_ref=fallback_spec.chosen_vulnerable_ref,
+            chosen_fixed_ref=fallback_spec.chosen_fixed_ref,
+            build_system=fallback_spec.build_system,
+            install_packages=fallback_spec.install_packages,
+            configure_commands=fallback_spec.configure_commands,
+            clean_commands=fallback_spec.clean_commands,
+            build_commands=fallback_spec.build_commands,
+            expected_binary_path=fallback_spec.expected_binary_path,
+            dockerfile_override=None,
+            build_script_override=None,
+            source_of_truth=fallback_spec.source_of_truth,
+            confidence=fallback_spec.confidence,
+            rationale=fallback_spec.rationale,
+        )
+
+
 class BuildStage:
     """构建阶段协调器。"""
 
@@ -121,7 +273,7 @@ class BuildStage:
     )
     README_PATTERNS = ("README", "README.md", "README.txt", "INSTALL", "INSTALL.md")
     MAX_REPLAN_ATTEMPTS = 3
-    REQUIRED_DOCKER_PACKAGES = ("git",)
+    REQUIRED_DOCKER_PACKAGES = ("ca-certificates", "git")
 
     def __init__(
         self,
@@ -134,6 +286,7 @@ class BuildStage:
         self.process_tool = process_tool or ProcessTool()
         self.git_tool = git_tool or GitTool(process_tool=self.process_tool)
         self.docker_tool = docker_tool or DockerTool(process_tool=self.process_tool)
+        self.planner = BuildPlanner(self)
 
     def build_plan(self, knowledge: KnowledgeModel, workspace: str) -> dict:
         """生成构建阶段最初的静态计划。"""
@@ -169,89 +322,238 @@ class BuildStage:
         return json.dumps(prompt, ensure_ascii=False)
 
     def run(self, knowledge: KnowledgeModel, workspace: str) -> BuildArtifact:
-        """执行构建阶段并返回构建产物。"""
+        """执行构建阶段并返回构建产物。
 
-        plan_meta = self.build_plan(knowledge=knowledge, workspace=workspace)
+        结构上拆成三层：
+        1. collect_context：准备 workspace、clone repo、收集本地证据
+        2. plan_and_execute：生成 BuildPlan，并在失败时做有限次再规划
+        3. verify_and_persist：固化最终产物并做事实型自检
+        """
+
         paths = BuildStagePaths(workspace)
-        self._prepare_workspace(paths)
+        subgraph = self.build_internal_graph()
+        result = subgraph.invoke(
+            {
+                "knowledge": knowledge,
+                "paths": paths,
+                "attempt": 0,
+            }
+        )
+        prepared = result["prepared"]
+        outcome = result["outcome"]
+        self.persist_build_outputs(
+            artifact=outcome.artifact,
+            paths=paths,
+            plan_meta=prepared.plan_meta,
+            cve_id=knowledge.cve_id,
+        )
+        return outcome.artifact
 
-        repo = self.git_tool.clone_repo(plan_meta["repo_url"], plan_meta["repo_dir"])
-        context = self.collect_build_context(knowledge=knowledge, repo_path=Path(repo.local_path), planner_attempt=1)
-        self.file_tool.write_text(
-            str(paths.build_context_yaml),
-            yaml.safe_dump(context.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
+    def build_internal_graph(self):
+        """Build the internal LangGraph subgraph for the build stage."""
+
+        builder = StateGraph(BuildGraphState)
+        builder.add_node("prepare", self._build_graph_prepare_node)
+        builder.add_node("plan", self._build_graph_plan_node)
+        builder.add_node("execute", self._build_graph_execute_node)
+
+        builder.add_edge(START, "prepare")
+        builder.add_edge("prepare", "plan")
+        builder.add_edge("plan", "execute")
+        builder.add_conditional_edges(
+            "execute",
+            self._route_after_build_execute,
+            {
+                "plan": "plan",
+                "done": END,
+            },
+        )
+        return builder.compile()
+
+    def _build_graph_prepare_node(self, state: BuildGraphState) -> BuildGraphState:
+        knowledge = state["knowledge"]
+        paths = state["paths"]
+        prepared = self.prepare_build_run(knowledge=knowledge, paths=paths)
+        return {
+            "prepared": prepared,
+            "current_context": prepared.context,
+            "attempt": 0,
+        }
+
+    def _build_graph_plan_node(self, state: BuildGraphState) -> BuildGraphState:
+        knowledge = state["knowledge"]
+        prepared = state["prepared"]
+        current_context = state["current_context"]
+        current_plan = self.plan_build(
+            knowledge=knowledge,
+            context=current_context,
+            project_name=prepared.plan_meta["project_name"],
+        )
+        return {"current_plan": current_plan}
+
+    def _build_graph_execute_node(self, state: BuildGraphState) -> BuildGraphState:
+        prepared = state["prepared"]
+        paths = state["paths"]
+        repo_path = Path(prepared.repo_path)
+        current_plan = self._normalize_build_plan(repo_path, state["current_plan"])
+        self._write_yaml_file(paths.build_plan_yaml, current_plan.model_dump(mode="json"))
+        outcome = self.execute_build_attempt(
+            repo_path=repo_path,
+            paths=paths,
+            plan_meta=prepared.plan_meta,
+            build_plan=current_plan,
         )
 
-        current_plan = self.plan_build(knowledge=knowledge, context=context, project_name=plan_meta["project_name"])
-        current_context = context
-        artifact: BuildArtifact | None = None
+        if outcome.artifact.build_success:
+            return {
+                "current_plan": current_plan,
+                "outcome": outcome,
+                "attempt": state.get("attempt", 0) + 1,
+                "should_retry": False,
+            }
+
+        replanned, next_context = self._replan_from_failed_attempt(
+            knowledge=state["knowledge"],
+            context=state["current_context"],
+            project_name=prepared.plan_meta["project_name"],
+            previous_plan=current_plan,
+            artifact=outcome.artifact,
+            repo_path=repo_path,
+        )
+        updates: BuildGraphState = {
+            "current_plan": current_plan,
+            "outcome": outcome,
+            "attempt": state.get("attempt", 0) + 1,
+            "should_retry": False,
+        }
+        if replanned is not None and next_context is not None:
+            updates["current_plan"] = replanned
+            updates["current_context"] = next_context
+            updates["should_retry"] = True
+        return updates
+
+    def _route_after_build_execute(self, state: BuildGraphState) -> str:
+        outcome = state.get("outcome")
+        attempt = state.get("attempt", 0)
+        current_plan = state.get("current_plan")
+        if outcome is None:
+            return "done"
+        if outcome.artifact.build_success:
+            return "done"
+        if attempt >= self.MAX_REPLAN_ATTEMPTS:
+            return "done"
+        if current_plan is None or not state.get("should_retry"):
+            return "done"
+        return "plan"
+
+    def prepare_build_run(self, knowledge: KnowledgeModel, paths: BuildStagePaths) -> BuildPreparedRun:
+        """Collect deterministic build inputs before any planning starts."""
+
+        plan_meta = self.build_plan(knowledge=knowledge, workspace=str(paths.workspace_root))
+        self._prepare_workspace(paths)
+        repo = self.git_tool.clone_repo(plan_meta["repo_url"], plan_meta["repo_dir"])
+        repo_path = Path(repo.local_path)
+        context = self.collect_build_context(
+            knowledge=knowledge,
+            repo_path=repo_path,
+            planner_attempt=1,
+        )
+        self._write_yaml_file(paths.build_context_yaml, context.model_dump(mode="json"))
+        return BuildPreparedRun(
+            plan_meta=plan_meta,
+            repo_path=str(repo_path),
+            context=context,
+        )
+
+    def plan_and_execute_build(
+        self,
+        knowledge: KnowledgeModel,
+        prepared: BuildPreparedRun,
+        paths: BuildStagePaths,
+    ) -> BuildExecutionOutcome:
+        """Generate a plan, execute it, and optionally replan after failures."""
+
+        repo_path = Path(prepared.repo_path)
+        current_context = prepared.context
+        current_plan = self.plan_build(
+            knowledge=knowledge,
+            context=current_context,
+            project_name=prepared.plan_meta["project_name"],
+        )
+        last_outcome: BuildExecutionOutcome | None = None
 
         for attempt in range(self.MAX_REPLAN_ATTEMPTS):
-            current_plan = self._normalize_build_plan(Path(repo.local_path), current_plan)
-            self.file_tool.write_text(
-                str(paths.build_plan_yaml),
-                yaml.safe_dump(current_plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
-            )
-
-            checkout = self.git_tool.checkout_ref(repo.local_path, current_plan.chosen_vulnerable_ref)
-            artifact = self._execute_build_plan(
-                repo_path=Path(repo.local_path),
+            current_plan = self._normalize_build_plan(repo_path, current_plan)
+            self._write_yaml_file(paths.build_plan_yaml, current_plan.model_dump(mode="json"))
+            last_outcome = self.execute_build_attempt(
+                repo_path=repo_path,
                 paths=paths,
-                plan_meta=plan_meta,
+                plan_meta=prepared.plan_meta,
                 build_plan=current_plan,
-                resolved_ref=checkout.current_ref,
             )
-            if artifact.build_success or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
+            if last_outcome.artifact.build_success or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
                 break
 
-            replanned = self.replan_after_failure(
+            replanned, next_context = self._replan_from_failed_attempt(
                 knowledge=knowledge,
                 context=current_context,
-                project_name=plan_meta["project_name"],
+                project_name=prepared.plan_meta["project_name"],
                 previous_plan=current_plan,
-                build_logs=artifact.build_logs,
-                failure_kind=self._classify_failure_kind(artifact.build_logs),
+                artifact=last_outcome.artifact,
+                repo_path=repo_path,
             )
-            if replanned is None:
+            if replanned is None or next_context is None:
                 break
-            replanned = self._normalize_build_plan(Path(repo.local_path), replanned)
-            if replanned.model_dump(mode="json") == current_plan.model_dump(mode="json"):
-                break
-            current_context = current_context.model_copy(
-                update={
-                    "planner_attempt": current_context.planner_attempt + 1,
-                    "previous_failure_kind": self._classify_failure_kind(artifact.build_logs),
-                    "previous_build_failure": artifact.build_logs[:6000],
-                }
-            )
             current_plan = replanned
+            current_context = next_context
 
-        if artifact is None:
+        if last_outcome is None:
             raise RuntimeError("build stage did not produce an artifact")
+        return last_outcome
 
-        self.file_tool.write_text(
-            str(paths.build_artifact_yaml),
-            yaml.safe_dump(artifact.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
+    def execute_build_attempt(
+        self,
+        repo_path: Path,
+        paths: BuildStagePaths,
+        plan_meta: dict[str, Any],
+        build_plan: BuildPlan,
+    ) -> BuildExecutionOutcome:
+        """Execute one concrete build attempt from a single plan."""
+
+        checkout = self.git_tool.checkout_ref(str(repo_path), build_plan.chosen_vulnerable_ref)
+        artifact = self._execute_build_plan(
+            repo_path=repo_path,
+            paths=paths,
+            plan_meta=plan_meta,
+            build_plan=build_plan,
+            resolved_ref=checkout.current_ref,
         )
+        return BuildExecutionOutcome(plan=build_plan, artifact=artifact)
+
+    def persist_build_outputs(
+        self,
+        artifact: BuildArtifact,
+        paths: BuildStagePaths,
+        plan_meta: dict[str, Any],
+        cve_id: str,
+    ) -> None:
+        """Persist the final build artifact and self-verification payload."""
+
+        self._write_yaml_file(paths.build_artifact_yaml, artifact.model_dump(mode="json"))
 
         try:
             verify_payload = self._verify_build_artifact(
                 artifact=artifact,
                 paths=paths,
                 plan_meta=plan_meta,
-                cve_id=knowledge.cve_id,
+                cve_id=cve_id,
             )
         except Exception as error:
             verify_payload = {
                 "verify_status": "verify_self_failed",
                 "verify_error": str(error),
             }
-        self.file_tool.write_text(
-            str(paths.build_verify_yaml),
-            yaml.safe_dump(verify_payload, sort_keys=False, allow_unicode=True),
-        )
-
-        return artifact
+        self._write_yaml_file(paths.build_verify_yaml, verify_payload)
 
     def collect_build_context(self, knowledge: KnowledgeModel, repo_path: Path, planner_attempt: int = 1) -> BuildContext:
         """Collect local build evidence from repo snapshots, patch diff, and knowledge outputs."""
@@ -283,12 +585,9 @@ class BuildStage:
         )
 
     def plan_build(self, knowledge: KnowledgeModel, context: BuildContext, project_name: str) -> BuildPlan:
-        """Plan the build using an LLM when available, otherwise use deterministic heuristics."""
+        """Plan the build using the dedicated planner."""
 
-        llm_plan = self._try_llm_build_plan(knowledge=knowledge, context=context, project_name=project_name)
-        if llm_plan is not None:
-            return llm_plan
-        return self._heuristic_build_plan(knowledge=knowledge, context=context, project_name=project_name)
+        return self.planner.plan(knowledge=knowledge, context=context, project_name=project_name)
 
     def replan_after_failure(
         self,
@@ -299,30 +598,66 @@ class BuildStage:
         build_logs: str,
         failure_kind: str,
     ) -> Optional[BuildPlan]:
-        """Give the model one chance to adjust the plan after a build failure."""
+        """Give the planner one chance to adjust the plan after a build failure."""
 
-        retry_context = context.model_copy(
+        return self.planner.replan_after_failure(
+            knowledge=knowledge,
+            context=context,
+            project_name=project_name,
+            previous_plan=previous_plan,
+            build_logs=build_logs,
+            failure_kind=failure_kind,
+        )
+
+    def _replan_from_failed_attempt(
+        self,
+        knowledge: KnowledgeModel,
+        context: BuildContext,
+        project_name: str,
+        previous_plan: BuildPlan,
+        artifact: BuildArtifact,
+        repo_path: Path,
+    ) -> tuple[Optional[BuildPlan], Optional[BuildContext]]:
+        """Convert a failed attempt into replanning inputs."""
+
+        failure_kind = self._classify_failure_kind(artifact.build_logs)
+        replanned = self.replan_after_failure(
+            knowledge=knowledge,
+            context=context,
+            project_name=project_name,
+            previous_plan=previous_plan,
+            build_logs=artifact.build_logs,
+            failure_kind=failure_kind,
+        )
+        if replanned is None:
+            return None, None
+
+        replanned = self._normalize_build_plan(repo_path, replanned)
+        if replanned.model_dump(mode="json") == previous_plan.model_dump(mode="json"):
+            return None, None
+
+        next_context = context.model_copy(
             update={
                 "planner_attempt": context.planner_attempt + 1,
                 "previous_failure_kind": failure_kind,
-                "previous_build_failure": build_logs[:6000],
+                "previous_build_failure": artifact.build_logs[:6000],
             }
         )
-        llm_plan = self._try_llm_build_plan(
-            knowledge=knowledge,
-            context=retry_context,
-            project_name=project_name,
-            previous_plan=previous_plan,
-        )
-        if llm_plan is None:
-            return None
-        return llm_plan
+        return replanned, next_context
 
     def _prepare_workspace(self, paths: BuildStagePaths) -> None:
         self.file_tool.ensure_dir(str(paths.workspace_root))
         self.file_tool.ensure_dir(str(paths.build_dir))
         self.file_tool.ensure_dir(str(paths.poc_dir))
         self.file_tool.ensure_dir(str(paths.verify_dir))
+
+    def _write_yaml_file(self, path: Path, payload: Any) -> None:
+        """Persist YAML using one consistent formatting policy."""
+
+        self.file_tool.write_text(
+            str(path),
+            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        )
 
     def _normalize_build_plan(self, repo_path: Path, build_plan: BuildPlan) -> BuildPlan:
         build_plan.chosen_vulnerable_ref = self._resolve_existing_ref(repo_path, build_plan.chosen_vulnerable_ref)
@@ -628,51 +963,76 @@ class BuildStage:
         return "\n".join(sections)
 
     def _heuristic_build_plan(self, knowledge: KnowledgeModel, context: BuildContext, project_name: str) -> BuildPlan:
-        snapshots = {item.label: item for item in context.snapshots}
-        chosen_snapshot = snapshots.get("fixed_parent") or snapshots.get("knowledge_vulnerable") or next(iter(snapshots.values()), None)
-        build_system = self._select_build_system(knowledge, chosen_snapshot.build_files if chosen_snapshot else [])
-        build_commands = self._select_build_commands(knowledge, build_system)
-        expected_binary = self._guess_binary_or_entrypoint(build_system, project_name)
-
-        chosen_vulnerable_ref = (
-            (chosen_snapshot.resolved_ref if chosen_snapshot else None)
-            or knowledge.vulnerable_ref
-            or context.task_vulnerable_ref
-            or ""
+        fallback_spec = self._build_fallback_spec(
+            knowledge=knowledge,
+            context=context,
+            project_name=project_name,
         )
         return BuildPlan(
-            chosen_vulnerable_ref=chosen_vulnerable_ref,
+            chosen_vulnerable_ref=fallback_spec.chosen_vulnerable_ref,
+            chosen_fixed_ref=fallback_spec.chosen_fixed_ref,
+            build_system=fallback_spec.build_system,
+            install_packages=fallback_spec.install_packages,
+            configure_commands=fallback_spec.configure_commands,
+            clean_commands=fallback_spec.clean_commands,
+            build_commands=fallback_spec.build_commands,
+            expected_binary_path=fallback_spec.expected_binary_path,
+            dockerfile_override=None,
+            build_script_override=None,
+            source_of_truth=fallback_spec.source_of_truth,
+            confidence=fallback_spec.confidence,
+            rationale=fallback_spec.rationale,
+        )
+
+    def _build_fallback_spec(
+        self,
+        knowledge: KnowledgeModel,
+        context: BuildContext,
+        project_name: str,
+    ) -> BuildFallbackSpec:
+        """Assemble all heuristic build decisions in one place."""
+
+        chosen_snapshot = self._choose_fallback_snapshot(context)
+        detected_files = chosen_snapshot.build_files if chosen_snapshot else []
+        build_system = self._select_build_system(knowledge, detected_files)
+        return BuildFallbackSpec(
+            chosen_vulnerable_ref=self._select_fallback_vulnerable_ref(knowledge, context, chosen_snapshot),
             chosen_fixed_ref=knowledge.fixed_ref or context.task_fixed_ref,
             build_system=build_system,
             install_packages=self._select_install_packages(build_system, knowledge),
             configure_commands=self._select_configure_commands(build_system),
             clean_commands=self._select_clean_commands(build_system),
-            build_commands=build_commands,
-            expected_binary_path=expected_binary,
-            dockerfile_override=None,
-            build_script_override=None,
+            build_commands=self._select_build_commands(knowledge, build_system),
+            expected_binary_path=self._guess_binary_or_entrypoint(build_system, project_name),
             source_of_truth="repo_scan" if chosen_snapshot and chosen_snapshot.build_files else "knowledge_hint",
             confidence="medium",
-            rationale="Heuristic plan based on cloned repository scan, patch-affected files, and knowledge hints.",
+            rationale="Heuristic fallback plan based on repo scan, patch-affected files, and knowledge hints.",
+        )
+
+    def _choose_fallback_snapshot(self, context: BuildContext) -> Optional[RefSnapshot]:
+        """Choose the best local snapshot for fallback planning."""
+
+        snapshots = {item.label: item for item in context.snapshots}
+        return snapshots.get("fixed_parent") or snapshots.get("knowledge_vulnerable") or next(iter(snapshots.values()), None)
+
+    def _select_fallback_vulnerable_ref(
+        self,
+        knowledge: KnowledgeModel,
+        context: BuildContext,
+        chosen_snapshot: Optional[RefSnapshot],
+    ) -> str:
+        """Resolve the vulnerable ref used by the deterministic fallback planner."""
+
+        return (
+            (chosen_snapshot.resolved_ref if chosen_snapshot else None)
+            or knowledge.vulnerable_ref
+            or context.task_vulnerable_ref
+            or ""
         )
 
     def _select_build_system(self, knowledge: KnowledgeModel, detected_files: list[str]) -> str:
-        mapping = [
-            ("Cargo.toml", "cargo"),
-            ("go.mod", "go"),
-            ("CMakeLists.txt", "cmake"),
-            ("meson.build", "meson"),
-            ("configure.ac", "autotools"),
-            ("configure", "autotools"),
-            ("Makefile", "make"),
-            ("makefile", "make"),
-            ("pom.xml", "maven"),
-            ("build.gradle", "gradle"),
-            ("build.gradle.kts", "gradle"),
-            ("package.json", "npm"),
-        ]
         lowered = {item.lower() for item in detected_files}
-        for filename, system in mapping:
+        for filename, system in self._build_system_mapping():
             if filename.lower() in lowered or any(path.endswith(filename) for path in detected_files):
                 return system
         if knowledge.build_systems:
@@ -682,18 +1042,7 @@ class BuildStage:
     def _select_build_commands(self, knowledge: KnowledgeModel, build_system: str) -> list[str]:
         if knowledge.build_commands:
             return list(knowledge.build_commands)
-        defaults = {
-            "cmake": ["cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug", "cmake --build build -j$(nproc)"],
-            "make": ["make clean || true", "make -j$(nproc)"],
-            "autotools": ["./configure", "make -j$(nproc)"],
-            "cargo": ["cargo build"],
-            "go": ["go build ./..."],
-            "meson": ["meson setup build", "ninja -C build"],
-            "maven": ["mvn package -DskipTests"],
-            "gradle": ["./gradlew build -x test"],
-            "npm": ["npm install", "npm run build"],
-            "unknown": ['echo "[build] build_commands unresolved after repo scan; please confirm build entrypoint." >&2', "exit 2"],
-        }
+        defaults = self._default_build_commands()
         return defaults.get(build_system, defaults["unknown"])
 
     def _select_configure_commands(self, build_system: str) -> list[str]:
@@ -711,7 +1060,49 @@ class BuildStage:
         return []
 
     def _select_install_packages(self, build_system: str, knowledge: KnowledgeModel) -> list[str]:
-        packages = {
+        defaults = self._default_install_packages()
+        packages = list(defaults.get(build_system, defaults["unknown"]))
+        packages = self._augment_install_packages_from_hints(packages, knowledge.install_commands)
+        return self._ensure_required_docker_packages(sorted(set(packages)))
+
+    def _build_system_mapping(self) -> list[tuple[str, str]]:
+        """Canonical file-to-build-system mapping for fallback planning."""
+
+        return [
+            ("Cargo.toml", "cargo"),
+            ("go.mod", "go"),
+            ("CMakeLists.txt", "cmake"),
+            ("meson.build", "meson"),
+            ("configure.ac", "autotools"),
+            ("configure", "autotools"),
+            ("Makefile", "make"),
+            ("makefile", "make"),
+            ("pom.xml", "maven"),
+            ("build.gradle", "gradle"),
+            ("build.gradle.kts", "gradle"),
+            ("package.json", "npm"),
+        ]
+
+    def _default_build_commands(self) -> dict[str, list[str]]:
+        """Default build commands used by the deterministic fallback planner."""
+
+        return {
+            "cmake": ["cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug", "cmake --build build -j$(nproc)"],
+            "make": ["make clean || true", "make -j$(nproc)"],
+            "autotools": ["./configure", "make -j$(nproc)"],
+            "cargo": ["cargo build"],
+            "go": ["go build ./..."],
+            "meson": ["meson setup build", "ninja -C build"],
+            "maven": ["mvn package -DskipTests"],
+            "gradle": ["./gradlew build -x test"],
+            "npm": ["npm install", "npm run build"],
+            "unknown": ['echo "[build] build_commands unresolved after repo scan; please confirm build entrypoint." >&2', "exit 2"],
+        }
+
+    def _default_install_packages(self) -> dict[str, list[str]]:
+        """Default system packages used by the deterministic fallback planner."""
+
+        return {
             "cmake": ["build-essential", "clang", "cmake", "git", "make", "pkg-config"],
             "make": ["build-essential", "clang", "git", "make", "pkg-config"],
             "autotools": ["autoconf", "automake", "build-essential", "clang", "git", "libtool", "make", "pkg-config"],
@@ -722,15 +1113,19 @@ class BuildStage:
             "gradle": ["git", "gradle", "openjdk-17-jdk"],
             "npm": ["git", "nodejs", "npm"],
             "unknown": ["build-essential", "clang", "git", "make", "pkg-config"],
-        }.get(build_system, ["build-essential", "clang", "git", "make", "pkg-config"])
-        for command in knowledge.install_commands:
+        }
+
+    def _augment_install_packages_from_hints(self, packages: list[str], install_commands: list[str]) -> list[str]:
+        """Expand fallback package guesses from lightweight knowledge hints."""
+
+        for command in install_commands:
             lower = command.lower()
             if "zlib" in lower and "zlib1g-dev" not in packages:
                 packages.append("zlib1g-dev")
             if "openssl" in lower or "libssl" in lower:
                 if "libssl-dev" not in packages:
                     packages.append("libssl-dev")
-        return self._ensure_required_docker_packages(sorted(set(packages)))
+        return packages
 
     def _guess_binary_or_entrypoint(self, build_system: str, project_name: str) -> Optional[str]:
         guesses = {
@@ -906,11 +1301,21 @@ class BuildStage:
                 merged.append(package)
         return sorted(set(merged))
 
+    def _missing_required_docker_packages(self, install_packages: list[str], dockerfile_content: str) -> list[str]:
+        install_package_set = {package.strip() for package in install_packages if package.strip()}
+        dockerfile_lower = dockerfile_content.lower()
+        missing: list[str] = []
+        for package in self.REQUIRED_DOCKER_PACKAGES:
+            if package not in install_package_set or package.lower() not in dockerfile_lower:
+                missing.append(package)
+        return missing
+
     def _ensure_dockerfile_override_has_required_tools(self, dockerfile_content: str, install_packages: list[str]) -> str:
         lower = dockerfile_content.lower()
-        if "apt-get install" in lower and " git" not in f" {' '.join(install_packages)} ":
+        missing_required = self._missing_required_docker_packages(install_packages, dockerfile_content)
+        if "apt-get install" in lower and missing_required:
             install_packages = self._ensure_required_docker_packages(install_packages)
-        if "apt-get install" in lower and "git" not in lower:
+        if "apt-get install" in lower and missing_required:
             lines = dockerfile_content.splitlines()
             updated: list[str] = []
             replaced = False
