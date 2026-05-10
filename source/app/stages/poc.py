@@ -52,6 +52,7 @@ class PocStagePaths:
         self.build_dir = self.artifacts_dir / "build"
         self.poc_dir = self.artifacts_dir / "poc"
         self.verify_dir = self.artifacts_dir / "verify"
+        self.llm_dir = self.poc_dir / "llm"
         self.payloads_dir = self.poc_dir / "payloads"
         self.inputs_dir = self.poc_dir / "inputs"
         self.poc_context_yaml = self.poc_dir / "poc_context.yaml"
@@ -91,6 +92,9 @@ class PocContext(BaseModel):
     repo_evidence_blocks: list[str] = Field(default_factory=list, description="README/tests/examples excerpts.")
     previous_failure_kind: str = Field(default="", description="Previous PoC failure kind.")
     previous_execution_log: str = Field(default="", description="Previous PoC execution log excerpt.")
+    previous_run_script_content: str = Field(default="", description="Previous rendered run script content.")
+    previous_payload_content: str = Field(default="", description="Previous primary payload content.")
+    previous_run_verify_report: str = Field(default="", description="Previous run_verify.yaml content.")
     planner_attempt: int = Field(default=1, description="Planner attempt number.")
 
 
@@ -234,9 +238,10 @@ class PocPlanner:
     def plan(self, knowledge: KnowledgeModel, build: BuildArtifact, context: PocContext) -> PocPlan:
         llm_plan = self.try_llm_plan(knowledge=knowledge, build=build, context=context)
         if llm_plan is not None:
-            return self.stage._normalize_poc_plan(llm_plan)
+            return self.stage._normalize_poc_plan(llm_plan, repo_url=context.repo_url)
         return self.stage._normalize_poc_plan(
-            self.heuristic_plan(knowledge=knowledge, build=build, context=context)
+            self.heuristic_plan(knowledge=knowledge, build=build, context=context),
+            repo_url=context.repo_url,
         )
 
     def replan_after_failure(
@@ -301,33 +306,102 @@ class PocPlanner:
             previous_plan=previous_plan,
             previous_artifact=previous_artifact,
         )
-        try:
-            response = model.invoke(
-                [
-                    SystemMessage(content="You return strict JSON only."),
-                    HumanMessage(content=prompt),
-                ]
-            )
-            parsed = parse_llm_json_payload(getattr(response, "content", response))
-            if parsed is None:
+        self.stage._persist_poc_llm_trace(context.planner_attempt, "prompt.txt", prompt)
+        retry_errors: list[str] = []
+        max_attempts = self.stage.MAX_LLM_NO_RESPONSE_RETRIES + 1
+        for invoke_attempt in range(1, max_attempts + 1):
+            try:
+                response = model.invoke(
+                    [
+                        SystemMessage(content="You return strict JSON only."),
+                        HumanMessage(content=prompt),
+                    ]
+                )
+                raw_response = getattr(response, "content", response)
+                raw_response_text = str(raw_response)
+                if self.stage._is_empty_llm_response(raw_response_text):
+                    retry_errors.append(f"Attempt {invoke_attempt}: empty response")
+                    if invoke_attempt < max_attempts:
+                        continue
+                    self.stage._persist_poc_llm_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "LLM returned no content after 3 attempts.",
+                    )
+                    return None
+                self.stage._persist_poc_llm_trace(context.planner_attempt, "response.txt", raw_response_text)
+                parsed = parse_llm_json_payload(raw_response)
+                if parsed is None:
+                    self.stage._persist_poc_llm_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "LLM response could not be parsed into JSON.",
+                    )
+                    return None
+                self.stage._persist_poc_llm_trace(
+                    context.planner_attempt,
+                    "parsed.json",
+                    json.dumps(parsed, ensure_ascii=False, indent=2),
+                )
+                plan = PocPlan(**parsed)
+                if not plan.target_binary and not plan.run_command:
+                    self.stage._persist_poc_llm_trace(
+                        context.planner_attempt,
+                        "error.txt",
+                        "LLM plan was missing both target_binary and run_command.",
+                    )
+                    return None
+                if previous_plan is not None:
+                    failure_kind = context.previous_failure_kind or self.stage._classify_failure_kind(previous_artifact.execution_logs if previous_artifact else "")
+                    normalized_plan = self.stage._normalize_poc_plan(plan, repo_url=context.repo_url)
+                    if not self.stage._is_valid_replan_candidate(previous_plan, normalized_plan, failure_kind=failure_kind):
+                        self.stage._persist_poc_llm_trace(
+                            context.planner_attempt,
+                            "error.txt",
+                            f"Rejected replan candidate for failure kind: {failure_kind or 'unknown'}",
+                        )
+                        return None
+                return plan
+            except Exception as error:
+                error_text = str(error)
+                retry_errors.append(f"Attempt {invoke_attempt}: {error_text}")
+                if self.stage._should_retry_llm_request(error_text) and invoke_attempt < max_attempts:
+                    continue
+                self.stage._persist_poc_llm_trace(
+                    context.planner_attempt,
+                    "error.txt",
+                    "\n".join(retry_errors),
+                )
                 return None
-            plan = PocPlan(**parsed)
-            if not plan.target_binary and not plan.run_command:
-                return None
-            return plan
-        except Exception:
-            return None
+        self.stage._persist_poc_llm_trace(
+            context.planner_attempt,
+            "error.txt",
+            "\n".join(retry_errors) or "LLM request failed without a response.",
+        )
+        return None
 
 
 class PocStage:
     """PoC 阶段协调器。"""
 
     MAX_REPLAN_ATTEMPTS = 3
+    MAX_LLM_NO_RESPONSE_RETRIES = 2
+    PATCH_EXCERPT_CHAR_LIMIT = 2200
+    REPO_EVIDENCE_BLOCK_LIMIT = 4
+    REPO_EVIDENCE_CHAR_LIMIT = 900
+    REFERENCE_POC_BLOCK_LIMIT = 2
+    REFERENCE_POC_CHAR_LIMIT = 1200
+    REFERENCE_POC_SUMMARY_CHAR_LIMIT = 220
+    PREVIOUS_EXECUTION_LOG_CHAR_LIMIT = 3500
+    PREVIOUS_RUN_SCRIPT_CHAR_LIMIT = 2000
+    PREVIOUS_PAYLOAD_CHAR_LIMIT = 2000
+    PREVIOUS_RUN_VERIFY_CHAR_LIMIT = 1600
 
     def __init__(self, file_tool: FileTool | None = None, docker_tool: DockerTool | None = None) -> None:
         self.file_tool = file_tool or FileTool()
         self.docker_tool = docker_tool or DockerTool()
         self.planner = PocPlanner(self)
+        self._active_poc_dir = ""
 
     def build_plan(self, knowledge: KnowledgeModel, build: BuildArtifact, workspace: str) -> dict:
         """生成 PoC 阶段静态元数据。"""
@@ -341,7 +415,7 @@ class PocStage:
             "repo_dir": str(paths.repo_dir),
             "poc_artifacts_dir": str(paths.poc_dir),
             "docker_image_tag": f"deeprepro-{knowledge.cve_id.lower()}-poc",
-            "base_image_tag": build.docker_image_tag or "",
+            "base_image_tag": build.compiled_image_tag or build.docker_image_tag or "",
             "target_binary": build.binary_or_entrypoint or build.expected_binary_path or "",
         }
 
@@ -390,7 +464,7 @@ class PocStage:
             build_system=build.build_system,
             build_success=build.build_success,
             target_binary=build.binary_or_entrypoint or build.expected_binary_path or "",
-            patch_diff_excerpt=patch_diff_text[:4000],
+            patch_diff_excerpt=self._truncate_text(patch_diff_text, self.PATCH_EXCERPT_CHAR_LIMIT),
             patch_affected_files=patch_affected_files or list(knowledge.affected_files),
             patch_changed_functions=patch_metadata["changed_functions"],
             patch_added_checks=patch_metadata["added_checks"],
@@ -406,7 +480,7 @@ class PocStage:
             reference_poc_summaries=reference_poc_summaries,
             repo_evidence_blocks=repo_evidence_blocks,
             previous_failure_kind=previous_failure_kind,
-            previous_execution_log=previous_execution_log[:6000],
+            previous_execution_log=self._truncate_text(previous_execution_log, self.PREVIOUS_EXECUTION_LOG_CHAR_LIMIT),
             planner_attempt=planner_attempt,
         )
 
@@ -436,8 +510,17 @@ class PocStage:
     def _prepare_workspace(self, paths: PocStagePaths) -> None:
         self.file_tool.ensure_dir(str(paths.workspace_root))
         self.file_tool.ensure_dir(str(paths.poc_dir))
+        self.file_tool.ensure_dir(str(paths.llm_dir))
         self.file_tool.ensure_dir(str(paths.payloads_dir))
         self.file_tool.ensure_dir(str(paths.inputs_dir))
+
+    def _persist_poc_llm_trace(self, planner_attempt: int, filename: str, content: str) -> None:
+        poc_dir = getattr(self, "_active_poc_dir", None)
+        if not poc_dir:
+            return
+        attempt_dir = Path(poc_dir) / "llm" / f"attempt-{planner_attempt}"
+        self.file_tool.ensure_dir(str(attempt_dir))
+        self.file_tool.write_text(str(attempt_dir / filename), (content or "").rstrip() + "\n")
 
     def _write_yaml_file(self, path: Path, payload: Any) -> None:
         """Persist YAML using one consistent formatting policy."""
@@ -510,14 +593,21 @@ class PocStage:
         previous_plan: Optional[PocPlan],
         previous_artifact: Optional[PoCArtifact],
     ) -> str:
+        reference_poc_blocks = self._reference_poc_prompt_blocks(
+            context.reference_poc_summaries,
+            detailed=previous_plan is not None,
+        )
         sections = [
             "You are the PoC Agent for a vulnerability reproduction framework.",
             "Infer the most plausible minimal reproducer from patch context, repository evidence, build outputs, and existing hints.",
             "Give substantial weight to semantic understanding of the vulnerability and the likely trigger path.",
             "Prefer a minimal reproducible trigger over a large script.",
             "Adapt any existing PoC or hint to the current workspace layout inside Docker.",
+            f"The build image keeps the checked-out project under {self._container_project_dir(context.repo_url)}.",
             "The repository is mounted at /workspace/repo.",
+            "Prefer compiled binaries from the build-image project directory. /workspace/repo is a mounted source tree and may not contain built executables.",
             "Payload files should normally be written under /workspace/artifacts/poc/payloads/ and auxiliary files under /workspace/artifacts/poc/inputs/.",
+            "You may freely change payload filename, suffix, on-disk format, auxiliary files, and wrapper/decoding steps when that improves the trigger.",
             "Return exactly one JSON object and no markdown fences.",
             "Schema:",
             json.dumps(
@@ -565,38 +655,52 @@ class PocStage:
             "Repository evidence excerpts:",
             "\n\n---\n\n".join(context.repo_evidence_blocks[:8]) or "<empty>",
             "Reference PoC excerpts:",
-            "\n\n---\n\n".join(context.reference_poc_summaries[:4]) or "<empty>",
+            "\n\n---\n\n".join(reference_poc_blocks) or "<empty>",
         ]
 
         if previous_plan is not None and previous_artifact is not None:
+            failure_kind = context.previous_failure_kind or self._classify_failure_kind(previous_artifact.execution_logs)
             sections.extend(
                 [
                     "",
-                    f"Previous failure kind: {context.previous_failure_kind or '<empty>'}",
+                    f"Previous failure kind: {failure_kind or '<empty>'}",
                     "Previous plan:",
                     yaml.safe_dump(previous_plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
                     f"Observed exit code: {previous_artifact.observed_exit_code}",
                     f"Observed crash type: {previous_artifact.observed_crash_type}",
                     "Previous execution logs:",
                     context.previous_execution_log or "<empty>",
+                    "Previous run.sh:",
+                    context.previous_run_script_content or "<empty>",
+                    "Previous payload content:",
+                    context.previous_payload_content or "<empty>",
+                    "Previous run_verify.yaml:",
+                    context.previous_run_verify_report or "<empty>",
                     "Adjust the plan to improve the trigger while staying minimal.",
+                    "Replan contract:",
+                    "- If docker image build failed, you must return a new dockerfile_override.",
+                    "- If the target ran but did not trigger the expected behavior, you must modify the payload, auxiliary files, run command, environment, or run_script_override.",
+                    "- If container execution failed, you must modify how the target is invoked, preferably via run_script_override or by changing target_binary/target_args/run_command/environment.",
+                    "- Do not only change rationale, confidence, or source_of_truth.",
                 ]
             )
         return "\n".join(sections)
 
-    def _normalize_poc_plan(self, plan: PocPlan) -> PocPlan:
+    def _normalize_poc_plan(self, plan: PocPlan, repo_url: str = "") -> PocPlan:
         if not plan.payload_filename:
             plan.payload_filename = "poc.txt"
         if not plan.payload_content:
             plan.payload_content = "trigger\n"
         plan.payload_filename = Path(plan.payload_filename).name
         plan.auxiliary_files = self._normalize_auxiliary_files(plan.auxiliary_files)
+        plan.target_binary = self._normalize_target_binary(plan.target_binary, repo_url)
         plan.target_args = [self._normalize_workspace_arg(arg, plan.payload_filename) for arg in plan.target_args]
         if not plan.run_command:
             args = " ".join(self._shell_quote(item) for item in plan.target_args)
             plan.run_command = f"{self._shell_quote(plan.target_binary)} {args}".strip()
         else:
-            plan.run_command = self._normalize_run_command(plan.run_command, plan.payload_filename)
+            plan.run_command = self._normalize_run_command(plan.run_command, plan.payload_filename, repo_url)
+            plan.run_command = self._align_run_command_with_target_binary(plan.run_command, plan.target_binary)
         if not plan.expected_stderr_patterns and plan.expected_crash_type:
             plan.expected_stderr_patterns = [plan.expected_crash_type]
         plan.expected_stack_keywords = sorted(set(plan.expected_stack_keywords))
@@ -621,7 +725,7 @@ class PocStage:
         }
         script_context = {
             "workspace_root": "/workspace",
-            "repo_dir": "/workspace/repo",
+            "execution_dir": self._default_execution_dir(plan.target_binary),
             "poc_artifacts_dir": "/workspace/artifacts/poc",
             "target_binary": plan.target_binary,
             "run_command": plan.run_command,
@@ -800,23 +904,21 @@ class PocStage:
             "current_plan": plan,
         }
         if not (outcome.artifact.execution_success and outcome.artifact.reproducer_verified):
-            current_context = state["current_context"].model_copy(
-                update={
-                    "planner_attempt": state["current_context"].planner_attempt + 1,
-                    "previous_failure_kind": self._classify_failure_kind(outcome.artifact.execution_logs),
-                    "previous_execution_log": outcome.artifact.execution_logs[:6000],
-                }
+            current_context = self._build_retry_context(
+                state["current_context"],
+                paths,
+                outcome.artifact,
             )
             updates["current_context"] = current_context
             replanned = self.replan_after_failure(
                 knowledge=state["knowledge"],
                 build=state["build"],
-                context=state["current_context"],
+                context=current_context,
                 previous_plan=plan,
                 previous_artifact=outcome.artifact,
             )
             if replanned is not None:
-                updates["current_plan"] = self._normalize_poc_plan(replanned)
+                updates["current_plan"] = self._normalize_poc_plan(replanned, repo_url=current_context.repo_url)
         return updates
 
     def _route_after_poc_execute(self, state: PocGraphState) -> str:
@@ -840,6 +942,7 @@ class PocStage:
 
         plan_meta = self.build_plan(knowledge=knowledge, build=build, workspace=str(paths.workspace_root))
         self._prepare_workspace(paths)
+        self._active_poc_dir = str(paths.poc_dir)
         context = self.collect_poc_context(
             knowledge=knowledge,
             build=build,
@@ -876,19 +979,13 @@ class PocStage:
                 previous_artifact=last_outcome.artifact,
             )
             if replanned is not None:
-                replanned = self._normalize_poc_plan(replanned)
+                replanned = self._normalize_poc_plan(replanned, repo_url=current_context.repo_url)
                 self._write_yaml_file(paths.poc_plan_yaml, replanned.model_dump(mode="json"))
                 last_outcome = self.execute_poc_attempt(paths, prepared.plan_meta, replanned)
                 if (last_outcome.artifact.execution_success and last_outcome.artifact.reproducer_verified) or attempt + 1 >= self.MAX_REPLAN_ATTEMPTS:
                     break
 
-            current_context = current_context.model_copy(
-                update={
-                    "planner_attempt": current_context.planner_attempt + 1,
-                    "previous_failure_kind": self._classify_failure_kind(last_outcome.artifact.execution_logs),
-                    "previous_execution_log": last_outcome.artifact.execution_logs[:6000],
-                }
-            )
+            current_context = self._build_retry_context(current_context, paths, last_outcome.artifact)
 
         if last_outcome is None:
             raise RuntimeError("poc stage did not produce an artifact")
@@ -909,6 +1006,77 @@ class PocStage:
         """Persist the final PoC artifact."""
 
         self._write_yaml_file(paths.poc_artifact_yaml, artifact.model_dump(mode="json"))
+
+    def _build_retry_context(self, context: PocContext, paths: PocStagePaths, artifact: PoCArtifact) -> PocContext:
+        run_verify_report = ""
+        if paths.run_verify_yaml.exists():
+            run_verify_report = self._truncate_text(
+                paths.run_verify_yaml.read_text(encoding="utf-8", errors="replace"),
+                self.PREVIOUS_RUN_VERIFY_CHAR_LIMIT,
+            )
+        return context.model_copy(
+            update={
+                "planner_attempt": context.planner_attempt + 1,
+                "previous_failure_kind": self._classify_failure_kind(artifact.execution_logs),
+                "previous_execution_log": self._truncate_text(
+                    artifact.execution_logs,
+                    self.PREVIOUS_EXECUTION_LOG_CHAR_LIMIT,
+                ),
+                "previous_run_script_content": self._truncate_text(
+                    artifact.run_script_content,
+                    self.PREVIOUS_RUN_SCRIPT_CHAR_LIMIT,
+                ),
+                "previous_payload_content": self._truncate_text(
+                    artifact.poc_content,
+                    self.PREVIOUS_PAYLOAD_CHAR_LIMIT,
+                ),
+                "previous_run_verify_report": run_verify_report,
+            }
+        )
+
+    def _is_valid_replan_candidate(
+        self,
+        previous_plan: PocPlan,
+        candidate_plan: PocPlan,
+        failure_kind: str = "",
+    ) -> bool:
+        if candidate_plan.model_dump(mode="json") == previous_plan.model_dump(mode="json"):
+            return False
+        normalized_failure_kind = (failure_kind or "").strip().lower()
+        if normalized_failure_kind == "docker_build":
+            return bool(candidate_plan.dockerfile_override)
+        if normalized_failure_kind == "container_run":
+            return self._changes_poc_execution_surface(previous_plan, candidate_plan)
+        return self._changes_trigger_strategy(previous_plan, candidate_plan)
+
+    def _changes_poc_execution_surface(self, previous_plan: PocPlan, candidate_plan: PocPlan) -> bool:
+        return any(
+            [
+                previous_plan.target_binary != candidate_plan.target_binary,
+                previous_plan.target_args != candidate_plan.target_args,
+                previous_plan.environment_variables != candidate_plan.environment_variables,
+                previous_plan.run_command != candidate_plan.run_command,
+                previous_plan.payload_filename != candidate_plan.payload_filename,
+                previous_plan.payload_content != candidate_plan.payload_content,
+                previous_plan.auxiliary_files != candidate_plan.auxiliary_files,
+                previous_plan.run_script_override != candidate_plan.run_script_override,
+                previous_plan.dockerfile_override != candidate_plan.dockerfile_override,
+            ]
+        )
+
+    def _changes_trigger_strategy(self, previous_plan: PocPlan, candidate_plan: PocPlan) -> bool:
+        return any(
+            [
+                previous_plan.payload_filename != candidate_plan.payload_filename,
+                previous_plan.payload_content != candidate_plan.payload_content,
+                previous_plan.auxiliary_files != candidate_plan.auxiliary_files,
+                previous_plan.target_args != candidate_plan.target_args,
+                previous_plan.environment_variables != candidate_plan.environment_variables,
+                previous_plan.run_command != candidate_plan.run_command,
+                previous_plan.run_script_override != candidate_plan.run_script_override,
+                previous_plan.target_binary != candidate_plan.target_binary,
+            ]
+        )
 
     def _read_patch_diff(self, cve_id: str) -> str:
         path = find_patch_diff(cve_id)
@@ -979,8 +1147,23 @@ class PocStage:
                 if not path.is_file():
                     continue
                 content = path.read_text(encoding="utf-8", errors="replace")
-                summaries.append(f"FILE: {path.name}\nCONTENT:\n{content[:3000]}")
-        return summaries[:4]
+                summaries.append(
+                    f"FILE: {path.name}\nCONTENT:\n{self._truncate_text(content, self.REFERENCE_POC_CHAR_LIMIT)}"
+                )
+        return summaries[: self.REFERENCE_POC_BLOCK_LIMIT]
+
+    def _reference_poc_prompt_blocks(self, blocks: list[str], detailed: bool) -> list[str]:
+        if detailed:
+            return blocks[: self.REFERENCE_POC_BLOCK_LIMIT]
+        compact: list[str] = []
+        for block in blocks[: self.REFERENCE_POC_BLOCK_LIMIT]:
+            lines = block.splitlines()
+            label = lines[0] if lines else "FILE: <unknown>"
+            content = "\n".join(lines[2:]) if len(lines) > 2 else "\n".join(lines[1:])
+            compact.append(
+                f"{label}\nSUMMARY:\n{self._truncate_text(content, self.REFERENCE_POC_SUMMARY_CHAR_LIMIT)}"
+            )
+        return compact
 
     def _collect_repo_evidence(self, repo_dir: Path, trigger_files: list[str]) -> list[str]:
         evidence_paths: list[Path] = []
@@ -1005,10 +1188,29 @@ class PocStage:
             if rel in seen:
                 continue
             seen.add(rel)
-            blocks.append(f"FILE: {rel}\nCONTENT:\n{path.read_text(encoding='utf-8', errors='replace')[:2500]}")
-            if len(blocks) >= 10:
+            content = path.read_text(encoding="utf-8", errors="replace")
+            blocks.append(f"FILE: {rel}\nCONTENT:\n{self._truncate_text(content, self.REPO_EVIDENCE_CHAR_LIMIT)}")
+            if len(blocks) >= self.REPO_EVIDENCE_BLOCK_LIMIT:
                 break
         return blocks
+
+    def _truncate_text(self, text: str, limit: int) -> str:
+        if limit <= 0:
+            return ""
+        value = text or ""
+        if len(value) <= limit:
+            return value
+        if limit <= 20:
+            return value[:limit]
+        omitted = len(value) - limit
+        return f"{value[: limit - 20]}\n...[truncated {omitted} chars]"
+
+    def _should_retry_llm_request(self, error_text: str) -> bool:
+        normalized = (error_text or "").strip().lower()
+        return "timed out" in normalized or "timeout" in normalized
+
+    def _is_empty_llm_response(self, raw_response: str) -> bool:
+        return not (raw_response or "").strip()
 
     def _load_reference_poc(self, cve_id: str) -> Optional[tuple[str, str]]:
         for prefix in ("Dataset", "source/Dataset"):
@@ -1022,14 +1224,14 @@ class PocStage:
 
     def _select_target_binary(self, build: BuildArtifact, context: PocContext, payload_filename: str = "") -> str:
         if build.binary_or_entrypoint:
-            return build.binary_or_entrypoint
+            return self._normalize_target_binary(build.binary_or_entrypoint, context.repo_url)
         if build.expected_binary_path:
-            return build.expected_binary_path
+            return self._normalize_target_binary(build.expected_binary_path, context.repo_url)
         interpreter = self._interpreter_for_payload(payload_filename)
         if interpreter:
             return interpreter
         if context.candidate_entrypoints:
-            return context.candidate_entrypoints[0]
+            return self._normalize_target_binary(context.candidate_entrypoints[0], context.repo_url)
         return "./target"
 
     def _select_target_args(self, knowledge: KnowledgeModel, payload_filename: str, context: PocContext, target_binary: str) -> list[str]:
@@ -1101,9 +1303,51 @@ class PocStage:
             return payload_path
         return arg.replace("./payloads/", "/workspace/artifacts/poc/payloads/")
 
-    def _normalize_run_command(self, run_command: str, payload_filename: str) -> str:
+    def _normalize_run_command(self, run_command: str, payload_filename: str, repo_url: str = "") -> str:
         payload_path = f"/workspace/artifacts/poc/payloads/{payload_filename}"
-        return run_command.replace("{payload}", payload_path).replace("./payloads/", "/workspace/artifacts/poc/payloads/")
+        if not repo_url:
+            return run_command.replace("{payload}", payload_path).replace("./payloads/", "/workspace/artifacts/poc/payloads/")
+        project_dir = self._container_project_dir(repo_url)
+        return (
+            run_command.replace("{payload}", payload_path)
+            .replace("./payloads/", "/workspace/artifacts/poc/payloads/")
+            .replace("/workspace/repo/", f"{project_dir}/")
+        )
+
+    def _align_run_command_with_target_binary(self, run_command: str, target_binary: str) -> str:
+        stripped = (run_command or "").strip()
+        if not stripped or not target_binary:
+            return run_command
+        quoted_target = self._shell_quote(target_binary)
+        parts = stripped.split(maxsplit=1)
+        first = parts[0].strip("'\"")
+        if Path(first).name != Path(target_binary).name:
+            return run_command
+        remainder = parts[1] if len(parts) > 1 else ""
+        return f"{quoted_target} {remainder}".strip()
+
+    def _container_project_dir(self, repo_url: str) -> str:
+        project_name = self._derive_project_name(repo_url)
+        return f"/src/{project_name}"
+
+    def _derive_project_name(self, repo_url: str) -> str:
+        name = repo_url.rstrip("/").split("/")[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        return re.sub(r"[^A-Za-z0-9._-]+", "-", name) or "target"
+
+    def _normalize_target_binary(self, target_binary: str, repo_url: str) -> str:
+        if not target_binary:
+            return target_binary
+        if not repo_url:
+            return target_binary
+        if target_binary.startswith("/"):
+            if target_binary.startswith("/workspace/repo/"):
+                return target_binary.replace("/workspace/repo/", f"{self._container_project_dir(repo_url)}/", 1)
+            return target_binary
+        project_dir = self._container_project_dir(repo_url)
+        cleaned = target_binary[2:] if target_binary.startswith("./") else target_binary
+        return f"{project_dir}/{cleaned}".replace("//", "/")
 
     def _render_template(self, template_name: str, context: dict[str, Any]) -> str:
         if Environment is not None and FileSystemLoader is not None and StrictUndefined is not None:
@@ -1141,9 +1385,9 @@ class PocStage:
                 "set +e",
                 "",
                 f'POC_ARTIFACTS_DIR="{context.get("poc_artifacts_dir", "/workspace/artifacts/poc")}"',
-                f'REPO_DIR="{context.get("repo_dir", "/workspace/repo")}"',
+                f'EXECUTION_DIR="{context.get("execution_dir", "/workspace")}"',
                 'mkdir -p "${POC_ARTIFACTS_DIR}"',
-                'cd "${REPO_DIR}"',
+                'cd "${EXECUTION_DIR}"',
                 'echo "target_binary=' + self._escape_for_echo(context.get("target_binary", "")) + '"',
                 'echo "trigger_command=' + self._escape_for_echo(context.get("run_command", "")) + '"',
                 'stdout_file="${POC_ARTIFACTS_DIR}/stdout.txt"',
@@ -1161,6 +1405,13 @@ class PocStage:
                 "",
             ]
         )
+
+    def _default_execution_dir(self, target_binary: str) -> str:
+        target = (target_binary or "").strip()
+        if target.startswith("/"):
+            parent = str(Path(target).parent)
+            return parent or "/workspace"
+        return "/workspace"
 
     def _compose_poc_logs(self, docker_build_result: Any, run_result: Any | None) -> str:
         parts = [

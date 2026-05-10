@@ -1,5 +1,7 @@
 """文件说明：Build 阶段测试。用于校验构建系统识别和节点重试语义。"""
 
+import json
+
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel
 from app.stages import build as build_module
@@ -133,6 +135,18 @@ def test_execute_build_plan_uses_script_overrides(tmp_path):
 
             return Result()
 
+        def commit_container(self, container_name, image_tag):
+            class Result:
+                success = True
+                exit_code = 0
+                stdout = "committed"
+                stderr = ""
+
+            return Result()
+
+        def remove_container(self, container_name):
+            return None
+
     stage = build_module.BuildStage(docker_tool=FakeDockerTool())
     paths = build_module.BuildStagePaths(str(tmp_path / "ws"))
     stage._prepare_workspace(paths)
@@ -156,6 +170,8 @@ def test_execute_build_plan_uses_script_overrides(tmp_path):
             "project_name": "demo",
             "project_dir_name": "demo",
             "docker_image_tag": "demo:latest",
+            "compiled_image_tag": "demo:compiled",
+            "build_container_name": "demo-build-run",
         },
         build_plan=plan,
         resolved_ref="deadbeef",
@@ -163,6 +179,7 @@ def test_execute_build_plan_uses_script_overrides(tmp_path):
 
     assert artifact.dockerfile_content == "FROM ubuntu:22.04\n"
     assert artifact.build_script_content == "#!/bin/bash\necho custom\n"
+    assert artifact.compiled_image_tag == "demo:compiled"
 
 
 def test_classify_failure_kind_distinguishes_docker_and_container_failures():
@@ -192,7 +209,13 @@ def test_normalize_build_plan_preserves_required_docker_packages(tmp_path):
 
     normalized = stage._normalize_build_plan(repo, plan)
 
+    assert "build-essential" in normalized.install_packages
+    assert "clang" in normalized.install_packages
+    assert "gcc" in normalized.install_packages
+    assert "g++" in normalized.install_packages
     assert "git" in normalized.install_packages
+    assert "make" in normalized.install_packages
+    assert "pkg-config" in normalized.install_packages
     assert "ca-certificates" in normalized.install_packages
 
 
@@ -214,8 +237,16 @@ def test_normalize_build_plan_repairs_dockerfile_override_without_required_packa
 
     normalized = stage._normalize_build_plan(repo, plan)
 
+    assert "clang" in normalized.install_packages
+    assert "gcc" in normalized.install_packages
+    assert "g++" in normalized.install_packages
     assert "git" in normalized.install_packages
     assert "ca-certificates" in normalized.install_packages
+    assert "make" in normalized.install_packages
+    assert "pkg-config" in normalized.install_packages
+    assert "clang" in normalized.dockerfile_override
+    assert "gcc" in normalized.dockerfile_override
+    assert "g++" in normalized.dockerfile_override
     assert "git" in normalized.dockerfile_override
     assert "ca-certificates" in normalized.dockerfile_override
 
@@ -226,5 +257,115 @@ def test_default_make_install_packages_include_ca_certificates():
 
     packages = stage._select_install_packages("make", knowledge)
 
+    assert "build-essential" in packages
+    assert "clang" in packages
+    assert "gcc" in packages
+    assert "g++" in packages
     assert "git" in packages
+    assert "make" in packages
+    assert "pkg-config" in packages
     assert "ca-certificates" in packages
+
+
+def test_build_stage_uses_localhost_proxy_with_host_network(monkeypatch):
+    stage = build_module.BuildStage()
+
+    monkeypatch.setenv("DOCKER_BUILD_PROXY", "http://127.0.0.1:7897")
+
+    assert stage._get_docker_build_proxy() == "http://127.0.0.1:7897"
+    assert stage._build_docker_proxy_args("http://127.0.0.1:7897")["HTTP_PROXY"] == "http://127.0.0.1:7897"
+    assert stage._select_docker_build_network_mode("http://127.0.0.1:7897") == "host"
+
+
+def test_build_replan_prompt_includes_rendered_artifacts():
+    stage = build_module.BuildStage()
+    knowledge = make_knowledge()
+    context = build_module.BuildContext(
+        cve_id=knowledge.cve_id,
+        repo_url=knowledge.repo_url or "",
+        previous_failure_kind="container_run",
+        previous_build_failure="compiler not found: clang",
+        previous_dockerfile_content="FROM ubuntu:20.04\nRUN apt-get install -y git make\n",
+        previous_build_script_content="#!/bin/bash\nexport CC=clang\nmake -j$(nproc)\n",
+    )
+    previous_plan = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+    )
+
+    prompt = stage._build_llm_prompt(
+        knowledge=knowledge,
+        context=context,
+        project_name="demo",
+        previous_plan=previous_plan,
+    )
+
+    assert "Previously rendered Dockerfile:" in prompt
+    assert "Previously rendered build.sh:" in prompt
+    assert "compiler not found: clang" in prompt
+    assert "dockerfile_override" in prompt
+    assert "build_script_override" in prompt
+
+
+def test_replan_candidate_requires_execution_surface_change_or_override():
+    stage = build_module.BuildStage()
+    previous_plan = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+    )
+
+    identical_shape = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+        rationale="different words only",
+    )
+    changed_packages = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "clang", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+    )
+    override_only = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+        dockerfile_override="FROM ubuntu:20.04\nRUN apt-get update && apt-get install -y clang git make\n",
+    )
+    script_override_only = build_module.BuildPlan(
+        chosen_vulnerable_ref="deadbeef",
+        build_system="make",
+        install_packages=["build-essential", "git", "make"],
+        build_commands=["make -j$(nproc)"],
+        build_script_override="#!/bin/bash\nexport CC=gcc\nmake -j$(nproc)\n",
+    )
+
+    assert stage._is_valid_replan_candidate(previous_plan, identical_shape) is False
+    assert stage._is_valid_replan_candidate(previous_plan, changed_packages) is True
+    assert stage._is_valid_replan_candidate(previous_plan, override_only) is True
+    assert stage._is_valid_replan_candidate(previous_plan, changed_packages, failure_kind="docker_build") is False
+    assert stage._is_valid_replan_candidate(previous_plan, override_only, failure_kind="docker_build") is True
+    assert stage._is_valid_replan_candidate(previous_plan, changed_packages, failure_kind="container_run") is False
+    assert stage._is_valid_replan_candidate(previous_plan, script_override_only, failure_kind="container_run") is True
+
+
+def test_build_llm_trace_is_persisted(tmp_path):
+    stage = build_module.BuildStage()
+    paths = build_module.BuildStagePaths(str(tmp_path / "ws"))
+    stage._prepare_workspace(paths)
+    stage._active_build_dir = str(paths.build_dir)
+
+    stage._persist_build_llm_trace(2, "prompt.txt", "hello prompt")
+    stage._persist_build_llm_trace(2, "parsed.json", json.dumps({"ok": True}))
+
+    prompt_path = paths.llm_dir / "attempt-2" / "prompt.txt"
+    parsed_path = paths.llm_dir / "attempt-2" / "parsed.json"
+
+    assert prompt_path.read_text(encoding="utf-8") == "hello prompt\n"
+    assert parsed_path.read_text(encoding="utf-8") == '{"ok": true}\n'

@@ -32,7 +32,9 @@
     "clang",
     "cmake",
     "curl",
+    "g++",
     "gdb",
+    "gcc",
     "git",
     "lld",
     "llvm",
@@ -52,7 +54,24 @@ FROM {{ base_image }}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG ALL_PROXY=""
+ARG NO_PROXY=""
+ARG http_proxy=""
+ARG https_proxy=""
+ARG all_proxy=""
+ARG no_proxy=""
+
 ENV DEBIAN_FRONTEND=noninteractive
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV ALL_PROXY=${ALL_PROXY}
+ENV NO_PROXY=${NO_PROXY}
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
+ENV all_proxy=${all_proxy}
+ENV no_proxy=${no_proxy}
 ENV WORKSPACE_ROOT={{ workspace_root }}
 ENV ARTIFACTS_ROOT={{ artifacts_root }}
 ENV BUILD_ARTIFACTS_DIR={{ build_artifacts_dir }}

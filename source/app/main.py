@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 from langgraph.types import Command
+
+
+def bootstrap_import_path() -> Path:
+    """Ensure the source directory is importable when running this file directly."""
+
+    source_root = Path(__file__).resolve().parents[1]
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    return source_root
+
+
+bootstrap_import_path()
 
 from app.orchestrator.graph import build_app_graph
 from app.schemas.task import TaskModel
