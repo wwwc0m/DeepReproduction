@@ -35,6 +35,31 @@ def make_context(**overrides):
     return verify_module.VerifyContext(**payload)
 
 
+def test_prepare_verify_run_prefers_compiled_image_tag(tmp_path):
+    stage = verify_module.VerifyStage()
+    workspace = tmp_path / "ws"
+    paths = verify_module.VerifyStagePaths(str(workspace))
+    paths.verify_dir.mkdir(parents=True, exist_ok=True)
+    paths.poc_dir.mkdir(parents=True, exist_ok=True)
+    paths.build_dir.mkdir(parents=True, exist_ok=True)
+    (paths.poc_dir / "run_verify.yaml").write_text("eligible_for_verify: true\n", encoding="utf-8")
+
+    knowledge = KnowledgeModel(cve_id="CVE-2022-0000", summary="demo", vulnerability_type="heap", repo_url="https://example.com/demo.git")
+    build = BuildArtifact(
+        dockerfile_content="FROM ubuntu:20.04\n",
+        build_script_content="#!/bin/bash\n",
+        build_success=True,
+        build_logs="ok",
+        docker_image_tag="demo:build",
+        compiled_image_tag="demo:compiled",
+    )
+    poc = PoCArtifact(poc_filename="poc.txt", poc_content="x", run_script_content="#!/bin/bash\n")
+
+    context = stage.prepare_verify_run(knowledge, build, poc, paths).context
+
+    assert context.docker_image_tag == "demo:compiled"
+
+
 def make_pass(
     exit_code=139,
     stdout="",

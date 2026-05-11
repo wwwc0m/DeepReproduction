@@ -349,7 +349,7 @@ class VerifyStage:
 
         return VerifyContext(
             cve_id=knowledge.cve_id,
-            docker_image_tag=build.docker_image_tag or "",
+            docker_image_tag=build.compiled_image_tag or build.docker_image_tag or "",
             chosen_vulnerable_ref=build.chosen_vulnerable_ref or "",
             chosen_fixed_ref=build.chosen_fixed_ref or "",
             project_dir_inside_image=self._resolve_project_dir(build),

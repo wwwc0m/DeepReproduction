@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal envs
 from app.config import build_chat_model
 from app.schemas.build_artifact import BuildArtifact
 from app.schemas.knowledge import KnowledgeModel
-from app.tools.docker_tools import DockerBuildRequest, DockerRunRequest, DockerTool
+from app.tools.docker_tools import DockerBuildRequest, DockerCommandResult, DockerRunRequest, DockerTool
 from app.tools.file_tools import FileTool
 from app.tools.git_tools import GitTool
 from app.tools.patch_tools import find_patch_diff
@@ -52,6 +53,7 @@ class BuildStagePaths:
         self.build_context_yaml = self.build_dir / "build_context.yaml"
         self.build_artifact_yaml = self.build_dir / "build_artifact.yaml"
         self.build_verify_yaml = self.build_dir / "build_verify.yaml"
+        self.llm_dir = self.build_dir / "llm"
 
 
 class RefSnapshot(BaseModel):
@@ -100,6 +102,8 @@ class BuildContext(BaseModel):
     planner_attempt: int = Field(default=1, description="Current planning attempt number.")
     previous_failure_kind: str = Field(default="", description="Failure kind such as docker_build or container_run.")
     previous_build_failure: str = Field(default="", description="Previous build failure logs for replanning.")
+    previous_dockerfile_content: str = Field(default="", description="Previously rendered Dockerfile for replanning.")
+    previous_build_script_content: str = Field(default="", description="Previously rendered build script for replanning.")
 
 
 class BuildPreparedRun(BaseModel):
@@ -164,14 +168,15 @@ class BuildPlanner:
         context: BuildContext,
         project_name: str,
         previous_plan: BuildPlan,
-        build_logs: str,
-        failure_kind: str,
+        previous_artifact: BuildArtifact,
     ) -> Optional[BuildPlan]:
         retry_context = context.model_copy(
             update={
                 "planner_attempt": context.planner_attempt + 1,
-                "previous_failure_kind": failure_kind,
-                "previous_build_failure": build_logs[:6000],
+                "previous_failure_kind": self.stage._classify_failure_kind(previous_artifact.build_logs),
+                "previous_build_failure": previous_artifact.build_logs[:6000],
+                "previous_dockerfile_content": previous_artifact.dockerfile_content[:8000],
+                "previous_build_script_content": previous_artifact.build_script_content[:8000],
             }
         )
         return self.try_llm_plan(
@@ -199,6 +204,7 @@ class BuildPlanner:
             project_name=project_name,
             previous_plan=previous_plan,
         )
+        self.stage._persist_build_llm_trace(context.planner_attempt, "prompt.txt", prompt)
         try:
             response = model.invoke(
                 [
@@ -206,14 +212,48 @@ class BuildPlanner:
                     HumanMessage(content=prompt),
                 ]
             )
-            parsed = parse_llm_json_payload(getattr(response, "content", response))
+            raw_response = getattr(response, "content", response)
+            raw_text = raw_response if isinstance(raw_response, str) else str(raw_response)
+            self.stage._persist_build_llm_trace(context.planner_attempt, "response.txt", raw_text)
+            parsed = parse_llm_json_payload(raw_response)
             if parsed is None:
+                self.stage._persist_build_llm_trace(
+                    context.planner_attempt,
+                    "error.txt",
+                    "Failed to parse build-agent response as JSON.",
+                )
                 return None
+            self.stage._persist_build_llm_trace(
+                context.planner_attempt,
+                "parsed.json",
+                json.dumps(parsed, ensure_ascii=False, indent=2),
+            )
             plan = BuildPlan(**parsed)
             if not plan.build_commands:
+                self.stage._persist_build_llm_trace(
+                    context.planner_attempt,
+                    "error.txt",
+                    "Parsed build-agent response did not include build_commands.",
+                )
+                return None
+            if previous_plan is not None and not self.stage._is_valid_replan_candidate(
+                previous_plan,
+                plan,
+                failure_kind=context.previous_failure_kind,
+            ):
+                self.stage._persist_build_llm_trace(
+                    context.planner_attempt,
+                    "error.txt",
+                    "Rejected build-agent replan because it did not produce a valid execution-surface override.",
+                )
                 return None
             return plan
-        except Exception:
+        except Exception as error:
+            self.stage._persist_build_llm_trace(
+                context.planner_attempt,
+                "error.txt",
+                f"{type(error).__name__}: {error}",
+            )
             return None
 
     def build_llm_prompt(
@@ -273,7 +313,16 @@ class BuildStage:
     )
     README_PATTERNS = ("README", "README.md", "README.txt", "INSTALL", "INSTALL.md")
     MAX_REPLAN_ATTEMPTS = 3
-    REQUIRED_DOCKER_PACKAGES = ("ca-certificates", "git")
+    REQUIRED_DOCKER_PACKAGES = (
+        "build-essential",
+        "ca-certificates",
+        "clang",
+        "g++",
+        "gcc",
+        "git",
+        "make",
+        "pkg-config",
+    )
 
     def __init__(
         self,
@@ -287,6 +336,7 @@ class BuildStage:
         self.git_tool = git_tool or GitTool(process_tool=self.process_tool)
         self.docker_tool = docker_tool or DockerTool(process_tool=self.process_tool)
         self.planner = BuildPlanner(self)
+        self._active_build_dir: str = ""
 
     def build_plan(self, knowledge: KnowledgeModel, workspace: str) -> dict:
         """生成构建阶段最初的静态计划。"""
@@ -309,6 +359,8 @@ class BuildStage:
             "poc_artifacts_dir": str(paths.poc_dir),
             "verify_artifacts_dir": str(paths.verify_dir),
             "docker_image_tag": f"deeprepro-{knowledge.cve_id.lower()}-build",
+            "compiled_image_tag": f"deeprepro-{knowledge.cve_id.lower()}-build-compiled",
+            "build_container_name": f"deeprepro-{knowledge.cve_id.lower()}-build-run",
         }
 
     def render_prompt(self, knowledge: KnowledgeModel, plan: dict) -> str:
@@ -451,6 +503,7 @@ class BuildStage:
 
         plan_meta = self.build_plan(knowledge=knowledge, workspace=str(paths.workspace_root))
         self._prepare_workspace(paths)
+        self._active_build_dir = str(paths.build_dir)
         repo = self.git_tool.clone_repo(plan_meta["repo_url"], plan_meta["repo_dir"])
         repo_path = Path(repo.local_path)
         context = self.collect_build_context(
@@ -595,8 +648,7 @@ class BuildStage:
         context: BuildContext,
         project_name: str,
         previous_plan: BuildPlan,
-        build_logs: str,
-        failure_kind: str,
+        previous_artifact: BuildArtifact,
     ) -> Optional[BuildPlan]:
         """Give the planner one chance to adjust the plan after a build failure."""
 
@@ -605,8 +657,7 @@ class BuildStage:
             context=context,
             project_name=project_name,
             previous_plan=previous_plan,
-            build_logs=build_logs,
-            failure_kind=failure_kind,
+            previous_artifact=previous_artifact,
         )
 
     def _replan_from_failed_attempt(
@@ -626,8 +677,7 @@ class BuildStage:
             context=context,
             project_name=project_name,
             previous_plan=previous_plan,
-            build_logs=artifact.build_logs,
-            failure_kind=failure_kind,
+            previous_artifact=artifact,
         )
         if replanned is None:
             return None, None
@@ -641,6 +691,8 @@ class BuildStage:
                 "planner_attempt": context.planner_attempt + 1,
                 "previous_failure_kind": failure_kind,
                 "previous_build_failure": artifact.build_logs[:6000],
+                "previous_dockerfile_content": artifact.dockerfile_content[:8000],
+                "previous_build_script_content": artifact.build_script_content[:8000],
             }
         )
         return replanned, next_context
@@ -650,6 +702,15 @@ class BuildStage:
         self.file_tool.ensure_dir(str(paths.build_dir))
         self.file_tool.ensure_dir(str(paths.poc_dir))
         self.file_tool.ensure_dir(str(paths.verify_dir))
+        self.file_tool.ensure_dir(str(paths.llm_dir))
+
+    def _persist_build_llm_trace(self, planner_attempt: int, filename: str, content: str) -> None:
+        build_dir = getattr(self, "_active_build_dir", None)
+        if not build_dir:
+            return
+        attempt_dir = Path(build_dir) / "llm" / f"attempt-{planner_attempt}"
+        self.file_tool.ensure_dir(str(attempt_dir))
+        self.file_tool.write_text(str(attempt_dir / filename), (content or "").rstrip() + "\n")
 
     def _write_yaml_file(self, path: Path, payload: Any) -> None:
         """Persist YAML using one consistent formatting policy."""
@@ -670,6 +731,40 @@ class BuildStage:
                 build_plan.install_packages,
             )
         return build_plan
+
+    def _is_valid_replan_candidate(
+        self,
+        previous_plan: BuildPlan,
+        candidate_plan: BuildPlan,
+        failure_kind: str = "",
+    ) -> bool:
+        if candidate_plan.model_dump(mode="json") == previous_plan.model_dump(mode="json"):
+            return False
+        normalized_failure_kind = (failure_kind or "").strip().lower()
+        if normalized_failure_kind == "docker_build":
+            if not candidate_plan.dockerfile_override:
+                return False
+            return True
+        if normalized_failure_kind == "container_run":
+            if not (candidate_plan.build_script_override or candidate_plan.dockerfile_override):
+                return False
+            return True
+        if candidate_plan.dockerfile_override or candidate_plan.build_script_override:
+            return True
+        return self._changes_build_execution_surface(previous_plan, candidate_plan)
+
+    def _changes_build_execution_surface(self, previous_plan: BuildPlan, candidate_plan: BuildPlan) -> bool:
+        return any(
+            [
+                previous_plan.install_packages != candidate_plan.install_packages,
+                previous_plan.configure_commands != candidate_plan.configure_commands,
+                previous_plan.clean_commands != candidate_plan.clean_commands,
+                previous_plan.build_commands != candidate_plan.build_commands,
+                previous_plan.build_system != candidate_plan.build_system,
+                previous_plan.chosen_vulnerable_ref != candidate_plan.chosen_vulnerable_ref,
+                previous_plan.chosen_fixed_ref != candidate_plan.chosen_fixed_ref,
+            ]
+        )
 
     def _execute_build_plan(
         self,
@@ -721,21 +816,42 @@ class BuildStage:
         self.file_tool.write_text(str(paths.build_script), build_script_content)
 
         workspace_root = str(paths.workspace_root.resolve())
+        docker_proxy = self._get_docker_build_proxy()
         docker_build_result = self.docker_tool.build_image(
             DockerBuildRequest(
                 workspace=workspace_root,
                 dockerfile_path=str(paths.dockerfile.resolve()),
                 image_tag=plan_meta["docker_image_tag"],
+                build_args=self._build_docker_proxy_args(docker_proxy),
+                network_mode=self._select_docker_build_network_mode(docker_proxy),
             )
         )
+        compiled_image_tag: Optional[str] = None
         if docker_build_result.success:
             build_result = self.docker_tool.run_container(
                 DockerRunRequest(
                     image_tag=plan_meta["docker_image_tag"],
                     workspace=workspace_root,
                     command=["bash", "/workspace/artifacts/build/build.sh"],
+                    container_name=plan_meta["build_container_name"],
+                    remove=False,
                 )
             )
+            if build_result.success:
+                commit_result = self.docker_tool.commit_container(
+                    plan_meta["build_container_name"],
+                    plan_meta["compiled_image_tag"],
+                )
+                if commit_result.success:
+                    compiled_image_tag = plan_meta["compiled_image_tag"]
+                else:
+                    build_result = DockerCommandResult(
+                        success=False,
+                        exit_code=commit_result.exit_code,
+                        stdout=build_result.stdout,
+                        stderr=(build_result.stderr + "\n" + commit_result.stderr).strip(),
+                    )
+            self.docker_tool.remove_container(plan_meta["build_container_name"])
         else:
             build_result = docker_build_result
 
@@ -759,6 +875,7 @@ class BuildStage:
             source_of_truth=build_plan.source_of_truth,
             binary_or_entrypoint=build_plan.expected_binary_path,
             docker_image_tag=plan_meta["docker_image_tag"],
+            compiled_image_tag=compiled_image_tag,
             sanitizer_enabled=self._sanitizer_enabled(build_script_content),
             build_success=docker_build_result.success and build_result.success,
             build_logs=build_logs,
@@ -900,6 +1017,9 @@ class BuildStage:
             "When replanning after failure, distinguish between docker image build failures and container runtime build failures.",
             "If previous_failure_kind is docker_build, prioritize fixing Dockerfile steps, install_packages, base image choice, and dockerfile_override.",
             "If previous_failure_kind is container_run, prioritize fixing build_commands, configure_commands, clean_commands, compiler choice, and build_script_override.",
+            "When a previous attempt is provided, treat the failure log, rendered Dockerfile, and rendered build.sh as the primary debugging evidence.",
+            "Do not repeat the same failing plan. Return a materially updated plan that explains how it addresses the observed failure.",
+            "When the failure points to missing packages, compiler mismatch, environment setup, or checkout/build script issues, prefer changing install_packages and/or emitting dockerfile_override/build_script_override.",
             "Any Dockerfile used for build execution must preserve the ability to clone the target repository inside the image.",
             "Do not remove required base packages such as git from install_packages or dockerfile_override.",
             "Return exactly one JSON object and no markdown fences.",
@@ -958,6 +1078,11 @@ class BuildStage:
                     yaml.safe_dump(previous_plan.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
                     "Previous failure logs:",
                     context.previous_build_failure or "<empty>",
+                    "Previously rendered Dockerfile:",
+                    context.previous_dockerfile_content or "<empty>",
+                    "Previously rendered build.sh:",
+                    context.previous_build_script_content or "<empty>",
+                    "Rewrite the plan using these concrete artifacts. If a script or Dockerfile edit is needed, use dockerfile_override and/or build_script_override instead of describing the change abstractly.",
                 ]
             )
         return "\n".join(sections)
@@ -1201,7 +1326,24 @@ class BuildStage:
             "",
             'SHELL ["/bin/bash", "-o", "pipefail", "-c"]',
             "",
+            'ARG HTTP_PROXY=""',
+            'ARG HTTPS_PROXY=""',
+            'ARG ALL_PROXY=""',
+            'ARG NO_PROXY=""',
+            'ARG http_proxy=""',
+            'ARG https_proxy=""',
+            'ARG all_proxy=""',
+            'ARG no_proxy=""',
+            "",
             "ENV DEBIAN_FRONTEND=noninteractive",
+            "ENV HTTP_PROXY=${HTTP_PROXY}",
+            "ENV HTTPS_PROXY=${HTTPS_PROXY}",
+            "ENV ALL_PROXY=${ALL_PROXY}",
+            "ENV NO_PROXY=${NO_PROXY}",
+            "ENV http_proxy=${http_proxy}",
+            "ENV https_proxy=${https_proxy}",
+            "ENV all_proxy=${all_proxy}",
+            "ENV no_proxy=${no_proxy}",
             f"ENV WORKSPACE_ROOT={context.get('workspace_root', '/workspace')}",
             f"ENV ARTIFACTS_ROOT={context.get('artifacts_root', '/workspace/artifacts')}",
             f"ENV BUILD_ARTIFACTS_DIR={context.get('build_artifacts_dir', '/workspace/artifacts/build')}",
@@ -1231,6 +1373,43 @@ class BuildStage:
             "",
         ]
         return "\n".join(lines)
+
+    def _get_docker_build_proxy(self) -> str:
+        for key in (
+            "DOCKER_BUILD_PROXY",
+            "DOCKER_PROXY",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ):
+            value = (os.getenv(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _build_docker_proxy_args(self, proxy_url: str) -> dict[str, str]:
+        if not proxy_url:
+            return {}
+        no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+        return {
+            "HTTP_PROXY": proxy_url,
+            "HTTPS_PROXY": proxy_url,
+            "ALL_PROXY": proxy_url,
+            "NO_PROXY": no_proxy,
+            "http_proxy": proxy_url,
+            "https_proxy": proxy_url,
+            "all_proxy": proxy_url,
+            "no_proxy": no_proxy,
+        }
+
+    def _select_docker_build_network_mode(self, proxy_url: str) -> Optional[str]:
+        if not proxy_url:
+            return None
+        lowered = proxy_url.lower()
+        if "127.0.0.1:" in lowered or "localhost:" in lowered:
+            return "host"
+        return None
 
     def _render_build_script_fallback(self, context: dict[str, Any]) -> str:
         build_commands = context.get("build_commands") or []
@@ -1348,17 +1527,18 @@ class BuildStage:
         # 4.14 timestamp
         result["verify_status"] = "ok"  # placeholder, updated at the end
         result["verified_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        runtime_image_tag = artifact.compiled_image_tag or artifact.docker_image_tag
 
         # 4.2 image_present / image_digest
         try:
-            if not artifact.docker_image_tag:
+            if not runtime_image_tag:
                 result["image_present"] = False
                 result["image_digest"] = None
-                verify_notes.append("docker_image_tag missing in BuildArtifact")
+                verify_notes.append("runtime image tag missing in BuildArtifact")
             else:
                 inspect_result = self.docker_tool.process_tool.run(
                     ProcessRequest(
-                        command=["docker", "image", "inspect", artifact.docker_image_tag, "--format", "{{.Id}}"],
+                        command=["docker", "image", "inspect", runtime_image_tag, "--format", "{{.Id}}"],
                         timeout_seconds=30,
                     )
                 )
@@ -1439,7 +1619,7 @@ class BuildStage:
                 )
                 bin_result = self.docker_tool.run_container(
                     DockerRunRequest(
-                        image_tag=artifact.docker_image_tag,
+                        image_tag=runtime_image_tag,
                         command=["bash", "-lc", check_cmd],
                     )
                 )
@@ -1481,7 +1661,7 @@ class BuildStage:
                 command = [
                     "docker", "run", "--rm",
                     "-v", f"{patch_diff_host_path}:/tmp/patch.diff:ro",
-                    artifact.docker_image_tag,
+                    runtime_image_tag,
                     "bash", "-lc",
                     'cd "${PROJECT_DIR}" && git apply --check /tmp/patch.diff',
                 ]
@@ -1512,7 +1692,7 @@ class BuildStage:
             else:
                 ref_result = self.docker_tool.run_container(
                     DockerRunRequest(
-                        image_tag=artifact.docker_image_tag,
+                        image_tag=runtime_image_tag,
                         command=["bash", "-lc", 'cd "${PROJECT_DIR}" && git rev-parse HEAD'],
                     )
                 )

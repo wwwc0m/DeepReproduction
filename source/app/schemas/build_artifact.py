@@ -28,6 +28,7 @@ class BuildArtifact(BaseModel):
     source_of_truth: str = Field(default="", description="构建结论主要来源")
     binary_or_entrypoint: Optional[str] = Field(default=None, description="确认后的二进制或执行入口")
     docker_image_tag: Optional[str] = Field(default=None, description="构建镜像标签")
+    compiled_image_tag: Optional[str] = Field(default=None, description="编译成功后提交得到的镜像标签")
     sanitizer_enabled: bool = Field(default=False, description="是否启用 sanitizer")
     build_success: bool = Field(default=False, description="构建是否成功")
     build_logs: str = Field(default="", description="构建日志")
